@@ -6,7 +6,6 @@ import core.stdc.ctype;
 
 class User {
   TCPConnection conn;
-  uint iid;
   bool loggedin;
   string nick;
   string username;
@@ -14,10 +13,20 @@ class User {
   string servername;
   string realname;
   Channel[string] channels;
+  Task rtask, wtask;
+  /* lastSentMessageId is used to make it easier to send a message to the union set
+   * of groups of users (mostly, users in channels.)
+   */
+  uint lastSentMessageId;
+  uint iid;
   this(TCPConnection conn, uint iid) {
     this.conn = conn;
     this.iid = iid;
     this.nick = "*";
+  }
+  void send(string msg) {
+    logInfo(format("(server) -> (%s)\t%s", nick, msg.stripRight));
+    wtask.send(msg);
   }
   void partAll() {
     foreach (chan; channels)
@@ -63,6 +72,7 @@ string coerceAscii(string s) {
 
 shared static this() {
   int iidCounter = 0;
+  int sentMessageCounter;
   string hostname = "127.0.0.1";
   string srvCmdFmt = ":logircd %s %s :%s\r\n";
   logircd.Channel[string] channels;
@@ -76,51 +86,53 @@ shared static this() {
     iidCounter++;
     bool quit = false;
 
-    void tx(string s) {
-      logInfo(format("--> %s", s.stripRight));
-      conn.write(s);
-    }
-    void txAll(string s) {
-      logInfo(format("==> %s", s.stripRight));
-      foreach (user; usersByIid)
-        user.conn.write(s);
-    }
-
     void sendMessage(string cmd, string msg) {
-      tx(format(srvCmdFmt, cmd, user.nick, msg));
+      user.send(format(srvCmdFmt, cmd, user.nick, msg));
     }
 
-    sendMessage("NOTICE", "*** Welcome to the server!");
-
-    auto rtask = runTask({
+    user.rtask = runTask({
       while (!quit && conn.connected) {
         auto line = cast(string) conn.readLine(4096, "\r\n");
         if (line.length == 0)
           continue;
-        logInfo(format("<-- %d bytes: %s", line.length, line));
+        logInfo(format("(server) <- (%s)\t %s", user.nick, line));
         auto words = split(line);
         switch (words[0]) {
           case "CAP":
             if (words.length == 2 && words[1] == "LS")
-              tx(format(":%s CAP %s LS :account-notify away-notify userhost-in-names\r\n", hostname, user.nick));
+              user.send(format(":%s CAP %s LS :account-notify away-notify userhost-in-names\r\n", hostname, user.nick));
             break;
           case "NICK":
             if (words.length < 2)
             {
-              tx(format(":%s 431 :No nick given.\r\n", hostname));
+              user.send(format(":%s 431 :No nick given.\r\n", hostname));
             }
             else if (words[1] in usersByNick)
             {
-              tx(format(":%s 433 %s :Nick already in use.\r\n", hostname, words[1]));
+              user.send(format(":%s 433 %s :Nick already in use.\r\n", hostname, words[1]));
             }
             else
             {
               if (user.nick in usersByNick)
                 usersByNick.remove(user.nick);
               usersByNick[words[1]] = user;
-              txAll(format(":%s!%s@%s NICK %s\r\n", user.nick, user.username, user.hostname, words[1]));
+              auto msg = format(":%s!%s@%s NICK %s\r\n", user.nick, user.username, user.hostname, words[1]);
+              sentMessageCounter++;
+              user.send(msg);
+              user.lastSentMessageId = sentMessageCounter;
+              foreach (channel; user.channels)
+              {
+                foreach (cuser; channel.users)
+                {
+                  if (cuser.lastSentMessageId != sentMessageCounter)
+                  {
+                    cuser.lastSentMessageId = sentMessageCounter;
+                    cuser.send(msg);
+                  }
+                }
+              }
               user.nick = words[1];
-              sendMessage("NOTICE", format("*** You are now known as %s", user.nick));
+              //sendMessage("NOTICE", format("*** You are now known as %s", user.nick));
             }
             break;
           case "USER":
@@ -134,16 +146,22 @@ shared static this() {
               user.username   = words[1];
               user.hostname   = words[2];
               user.servername = words[3];
-              user.realname   = words[4][1..$] ~ join(words[5..$], " ");
+              /* TODO check for colon? */
+              user.realname   = line[words[4].ptr - line.ptr + 1 .. $];
               user.loggedin   = true;
-              tx(format(":%s 001 %s :Welcome to LogIRCd, %s!%s@%s\r\n", hostname, user.nick, user.nick, user.username, user.hostname));
-              tx(format(":%s 002 %s :Your host is %s, running LogIRCd version 0.0.0\r\n", hostname, user.nick, hostname));
-              tx(format(":%s 003 %s :This server was created Sat Jul 5 2014 at 23:39:00 EDT\r\n", hostname, user.nick));
-              tx(format(":%s 004 %s %s 0.0.0 a aioOw abehiIklmnostv\r\n", hostname, user.nick, hostname));
-              tx(format(":%s 251 %s :There are %d users and 0 invisible on 1 servers\r\n", hostname, user.nick, usersByIid.length));
-              tx(format(":%s 252 %s 0 :operator(s) online\r\n", hostname, user.nick));
-              tx(format(":%s 372 %s :This is the message of the day!\r\n", hostname, user.nick));
-              tx(format(":%s!%s@%s MODE %s +x\r\n", user.nick, user.username, user.hostname, user.nick));
+              user.send(format(":%s 001 %s :Welcome to LogIRCd, %s!%s@%s\r\n",
+                hostname, user.nick, user.nick, user.username, user.hostname));
+              user.send(format(":%s 002 %s :Your host is %s, running LogIRCd version 0.0.0\r\n",
+                hostname, user.nick, hostname));
+              user.send(format(":%s 003 %s :This server was created Sat Jul 5 2014 at 23:39:00 EDT\r\n",
+                hostname, user.nick));
+              user.send(format(":%s 004 %s %s 0.0.0 a aioOw abehiIklmnostv\r\n",
+                hostname, user.nick, hostname));
+              user.send(format(":%s 251 %s :There are %d users and 0 invisible on 1 servers\r\n",
+                hostname, user.nick, usersByIid.length));
+              user.send(format(":%s 252 %s 0 :operator(s) online\r\n", hostname, user.nick));
+              user.send(format(":%s 372 %s :This is the message of the day!\r\n", hostname, user.nick));
+              user.send(format(":%s!%s@%s MODE %s +x\r\n", user.nick, user.username, user.hostname, user.nick));
               // TODO
             }
             break;
@@ -167,25 +185,52 @@ shared static this() {
             else {
               if (words[1] !in channels)
                 channels[words[1]] = new logircd.Channel(words[1]);
+              /* Broadcast JOIN message */
               auto channel = channels[words[1]];
-              txAll(format(":%s!%s@%s JOIN %s\r\n", user.nick, user.username, user.hostname, channel.name));
-              tx(format(":%s 332 %s %s :%s\r\n", hostname, user.nick, channel.name, channel.topic));
-              tx(format(":%s 333 %s %s voxel!voxel@host86-175-172-11.range86-175.btcentralplus.com 1425226259\r\n", 
-                hostname, user.nick, channel.name));
+              auto msg = format(":%s!%s@%s JOIN %s\r\n", user.nick, user.username, user.hostname, channel.name);
               channel.join(user);
               foreach (cuser; channel.users)
-              tx(format(":%s 353 %s @ %s :%s\r\n", hostname, user.nick, channel.name, cuser.nick));
-              tx(format(":%s 366 %s %s :End of /NAMES list.\r\n", hostname, user.nick, channel.name));
-              // TODO send 333?
-
+                cuser.send(msg);
+              /* 332 topic */
+              user.send(format(":%s 332 %s %s :%s\r\n", hostname, user.nick, channel.name, channel.topic));
+              /* 333 topic set */
+              user.send(
+                format(":%s 333 %s %s voxel!voxel@host86-175-172-11.range86-175.btcentralplus.com 1425226259\r\n", 
+                hostname, user.nick, channel.name));
+              auto cuserstr = cast(string) join(map!"a.nick"(channel.users.values), " ");
+              user.send(format(":%s 353 %s @ %s :%s\r\n", hostname, user.nick, channel.name, cuserstr));
+              foreach (cuser; channel.users)
+              {
+                /* WHO response
+                user.send(format(":%s 352 %s %s %s %s %s %s Hx :0 %s\r\n"
+                , hostname
+                , user.nick
+                , channel.name
+                , cuser.username
+                , cuser.hostname
+                , hostname // TODO?
+                , cuser.nick
+                , cuser.realname
+                ));*/
+              }
+              user.send(format(":%s 366 %s %s :End of /NAMES list.\r\n", hostname, user.nick, channel.name));
+              /* WHO response
+              user.send(format(":%s 315 %s %s :End of /WHO list.\r\n", hostname, user.nick, channel.name));
+              */
             }
             break;
           case "PRIVMSG":
             if (words.length < 3)
             { /* TODO */ }
             else {
-              txAll(format(":%s!%s@%s PRIVMSG %s :%s\r\n", user.nick, user.username, user.hostname, words[1],
-                words[2][1..$] ~ join(words[3..$])));
+              if (words[1] in usersByNick)
+                usersByNick[words[1]].send(format(":%s!%s@%s PRIVMSG %s :%s\r\n",
+                  user.nick, user.username, user.hostname, words[1], line[words[2].ptr - line.ptr + 1 .. $]));
+              else if (words[1] in channels)
+                foreach (cuser; channels[words[1]].users)
+                  if (cuser !is user)
+                    cuser.send(format(":%s!%s@%s PRIVMSG %s :%s\r\n",
+                      user.nick, user.username, user.hostname, words[1], line[words[2].ptr - line.ptr + 1 .. $]));
             }
             break;
           case "PING":
@@ -194,7 +239,7 @@ shared static this() {
              * we are the one being pinged! XXX */
             if (words.length == 2) {
               /* This is how AfterNET responded... XXX TODO */
-              tx(format(":%s PONG %s :%s\r\n", words[1], words[1], words[1]));
+              user.send(format(":%s PONG %s :%s\r\n", words[1], words[1], words[1]));
             }
             break;
           //case "LIST":
@@ -206,7 +251,18 @@ shared static this() {
       }
     });
 
-    rtask.join;
+    user.wtask = runTask({
+      while (!quit && conn.connected) {
+        receive((string s) {
+          conn.write(s);
+        });
+      }
+    });
+
+    sendMessage("NOTICE", "*** Welcome to the server!");
+
+    user.rtask.join;
+    user.wtask.join;
 
     if (conn.connected)
       conn.close;
