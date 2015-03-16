@@ -1,8 +1,8 @@
 {
 	"name": "logircd",
-	"description": "A simple vibe.d server application.",
-	"copyright": "Copyright © 2015, donny",
-	"authors": ["donny"],
+	"description": "A crappy IRC server.",
+	"copyright": "Copyright © 2015, Don Viszneki <don@codebad.com>",
+	"authors": ["Don Viszneki <don@codebad.com>"],
 	"dependencies": {
 		"vibe-d": ">=0.7.17"
 	},
