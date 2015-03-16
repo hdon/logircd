@@ -32,10 +32,6 @@ class User {
     foreach (chan; channels)
       chan.part(this);
   }
-  static if (0)
-  string snick() {
-    return loggedin ? nick : "*";
-  }
 }
 
 class Channel {
@@ -261,15 +257,18 @@ shared static this() {
 
     sendMessage("NOTICE", "*** Welcome to the server!");
 
+    scope(exit)
+    {
+      user.partAll;
+      if (conn.connected)
+        conn.close;
+      usersByIid.remove(user.iid);
+      usersByNick.remove(user.nick);
+    }
+
     user.rtask.join;
     user.wtask.join;
 
-    if (conn.connected)
-      conn.close;
-
-    user.partAll;
-    usersByIid.remove(user.iid);
-    usersByNick.remove(user.nick);
     logInfo(":::Reached end of connection control scope");
   });
 
