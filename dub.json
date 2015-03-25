@@ -6,5 +6,13 @@
 	"dependencies": {
 		"vibe-d": ">=0.7.17"
 	},
-	"versions": ["VibeDefaultMain"]
+	"versions": ["VibeDefaultMain"],
+  	"buildTypes": {
+		"debug": {
+			"buildOptions": ["debugMode", "debugInfo", "optimize"]
+		},
+		"debug-profile": {
+			"buildOptions": ["debugMode", "debugInfo", "profile"]
+		}
+	}
 }
