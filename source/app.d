@@ -1,5 +1,6 @@
 module logircd;
 import vibe.d;
+import std.range;
 import std.array;
 import std.string;
 import core.stdc.ctype;
@@ -73,6 +74,19 @@ class Channel {
   enum MODE_s = 0x00000004;    /* SECRET */
   enum MODE_i = 0x00000008;    /* INVITE */
   enum MODE_m = 0x00000010;    /* MODERATED */
+  static immutable uint MODES[char];
+
+  static this()
+  {
+    MODES = [
+      'n': MODE_n
+    , 't': MODE_t
+    , 's': MODE_s
+    , 'i': MODE_i
+    , 'm': MODE_m
+    ];
+  }
+
   uint bmodes;
 
   UserChannel[uint] users;
@@ -117,10 +131,15 @@ class Channel {
       user.user.send(format(":%s 333 %s %s %s\r\n", serverHostname, user.user.nick, name, topicWhoTime));
     }
   }
+
   string names() {
     return cast(string) std.array.join(map!((UserChannel uc){
       return format("%s%s", uc.channelOperator?"@":"", uc.user.nick);
     })(users.values), " ");
+  }
+
+  auto readUsers() {
+    return map!((UserChannel uc){return uc.user;})(users.values);
   }
 
   string modeString() {
@@ -174,17 +193,28 @@ string coerceAscii(string s) {
   return cast(string) r;
 }
 
-/* Transmit server [numeric] message to specified user -- this function expects that
- * the first format in 'fmt' is an %s to be substituted with the receiving user's
- * nick.
- */
 void txsn(string fmt, T...)(User user, T a) {
   user.send(format(serverMessagePrefix ~ fmt ~ "\r\n", user.nick, a));
 }
-/* Retransmit user message to specified user */
-void txum(string fmt, T...)(User user, T a) {
-  user.send(format(":%s!%s@%s " ~ fmt ~ "\r\n", user.nick, user.username, user.hostname, a));
+void txsn(string fmt, R, T...)(R users, T a)
+if (isForwardRange!R && is(ElementType!R : User))
+{
+  foreach (user; users)
+    user.send(format(serverMessagePrefix ~ fmt ~ "\r\n", user.nick, a));
 }
+
+void txum(string fmt, T...)(User recipient, User user, T a)
+if (T.length == 0 || !isForwardRange!(T[0]) || !is(ElementType!T : User))
+{
+  recipient.send(format(":%s!%s@%s " ~ fmt ~ "\r\n", user.nick, user.username, user.hostname, a));
+}
+void txum(string fmt, R, T...)(R recipients, User user, T a)
+if (isForwardRange!R && is(ElementType!R : User))
+{
+  foreach (recipient; recipients)
+    recipient.send(format(":%s!%s@%s " ~ fmt ~ "\r\n", user.nick, user.username, user.hostname, a));
+}
+
 /* RPL_WHOREPLY */
 void tx352(User user, UserChannel uc) {
   user.txsn!"352 %s %s ~%s %s %s %s H%sx :0 %s"(
@@ -202,12 +232,6 @@ void tx403(User user, string channame) {
   user.txsn!"403 %s %s :No such channel"(channame);
 }
 
-shared {
-  logircd.Channel[string] channels;
-  User[string] usersByNick;
-  User[uint] usersByIid;
-}
-
 shared static this() {
   serverHostname = to!string(core.stdc.stdlib.getenv("HOSTNAME"));
   serverMessagePrefix = ":" ~ serverHostname ~ " ";
@@ -215,6 +239,9 @@ shared static this() {
   int iidCounter = 0;
   int sentMessageCounter;
   string srvCmdFmt = ":logircd %s %s :%s\r\n";
+  logircd.Channel[string] channels;
+  User[string] usersByNick;
+  User[uint] usersByIid;
 
   listenTCP(6667, (conn) {
     logInfo("New client!");
@@ -227,9 +254,6 @@ shared static this() {
     void sendMessage(string cmd, string msg) {
       user.send(format(srvCmdFmt, cmd, user.nick, msg));
     }
-
-    void txsn(string fmt, T...)(T a) { user.txsn!fmt(a); }
-    void txum(string fmt, T...)(T a) { user.txum!fmt(a); }
 
     user.rtask = runTask({
       import std.stdio;
@@ -261,20 +285,20 @@ shared static this() {
         switch (words[0]) {
           case "CAP":
             if (words.length == 2 && words[1] == "LS")
-              txsn!"CAP %s LS :account-notify away-notify userhost-in-names";
+              user.txsn!"CAP %s LS :account-notify away-notify userhost-in-names";
             // TODO REQ -> ACK
             break;
           case "NICK":
             if (words.length < 2)
             {
-              txsn!"431 %s :No nick given.";
+              user.txsn!"431 %s :No nick given.";
             }
             else if (words[1] in usersByNick)
             {
-              txsn!"433 %s :Nick already in use."(words[1]);
+              user.txsn!"433 %s :Nick already in use."(words[1]);
             }
             else if (!User.validateNick(words[1])) {
-              txsn!"432 %s %s :Erroneous nickname."(words[1]);
+              user.txsn!"432 %s %s :Erroneous nickname."(words[1]);
             }
             else
             {
@@ -314,14 +338,14 @@ shared static this() {
               /* TODO check for colon? */
               user.realname   = words[4];
               user.loggedin   = true;
-              txsn!"001 %s :Welcome to LogIRCd, %s!%s@%s"(user.nick, user.username, user.hostname);
-              txsn!"002 %s :Your host is %s, running %s"(serverHostname, softwareFullname);
-              txsn!"003 %s :This server was created Sat Jul 5 2014 at 23:39:00 EDT";
-              txsn!"004 %s %s %s a aioOw abehiIklmnostv"(serverHostname, softwareFullname);
-              txsn!"251 %s :There are %d users and 0 invisible on 1 servers"(usersByNick.length);
-              txsn!"252 %s 0 :operator(s) online";
-              txsn!"372 %s :This is the message of the day!";
-              txum!"MODE %s +x"(user.nick);
+              user.txsn!"001 %s :Welcome to LogIRCd, %s!%s@%s"(user.nick, user.username, user.hostname);
+              user.txsn!"002 %s :Your host is %s, running %s"(serverHostname, softwareFullname);
+              user.txsn!"003 %s :This server was created Sat Jul 5 2014 at 23:39:00 EDT";
+              user.txsn!"004 %s %s %s a aioOw abehiIklmnostv"(serverHostname, softwareFullname);
+              user.txsn!"251 %s :There are %d users and 0 invisible on 1 servers"(usersByNick.length);
+              user.txsn!"252 %s 0 :operator(s) online";
+              user.txsn!"372 %s :This is the message of the day!";
+              user.txum!"MODE %s +x"(user, user.nick);
               // TODO
             }
             break;
@@ -332,21 +356,21 @@ shared static this() {
                 auto channel = channels[words[1]];
                 if (channel.topic) {
                   /* 332 RPL_TOPIC */
-                  txsn!"332 %s %s :%s"(channel.name, channel.topic);
+                  user.txsn!"332 %s %s :%s"(channel.name, channel.topic);
                   /* 333 RPL_TOPICWHOTIME */
-                  txsn!"333 %s %s %s"(channel.name, channel.topicWhoTime);
+                  user.txsn!"333 %s %s %s"(channel.name, channel.topicWhoTime);
                 } else {
                   /* 331 RPL_NOTOPIC */
-                  txsn!"331 %s %s :No topic set"(words[1]);
+                  user.txsn!"331 %s %s :No topic set"(words[1]);
                 }
               }
-              else txsn!"403 %s %s :No such channel"(words[1]);
+              else user.txsn!"403 %s %s :No such channel"(words[1]);
             } else if (words.length > 2) {
               /* Set topic */
               if (words[1] in channels) {
                 channels[words[1]].setTopic(user, words[2]);
               }
-              else txsn!"403 %s %s :No such channel"(words[1]);
+              else user.txsn!"403 %s %s :No such channel"(words[1]);
             }
             else sendMessage("NOTICE", "Sorry, logircd did not understand your TOPIC command");
             break;
@@ -370,115 +394,121 @@ shared static this() {
                 /* RPL_CHANNELMODEIS */
                 if (words.length == 2)
                 {
-                  txsn!"423 %s %s %s"(target, chan.modeString); 
+                  user.txsn!"423 %s %s %s"(target, chan.modeString); 
                   break;
                 }
 
-                auto mode = words[2];
+                auto modeOpts = words[2];
 
-                if (words.length == 3)
+                if (words.length >= 3) // TODO remove condition
                 {
-                  bool modeOn;
-                  if (mode[0] == '+')
-                    modeOn = true;
-                  else if (mode[0] == '-')
-                    modeOn = false;
-                  else
+                  auto modes = chan.bmodes;
+                  auto modeMask = modes.max;
+                  auto modeSet = modes.init;
+
+                  bool modeSign = true;
+                  size_t iModeArg = 3;
+                  bool bansShown = false;
+
+                  char[] echoModeAdded;
+                  char[] echoModeRemoved;
+                  string[] echoBansAdded;
+                  string[] echoBansRemoved;
+
+                  foreach (c; modeOpts)
                   {
-                    sendMessage("NOTICE", "Sorry, that invocation of MODE has not been implemented.");
-                    break;
+                    switch (c)
+                    {
+                      case '+':
+                        modeSign = true;
+                        break;
+                      case '-':
+                        modeSign = false;
+                        break;
+                      case 'n': case 't': case 's': case 'i': case 'm':
+                        auto modeBit = Channel.MODES[c];
+                        if (((chan.bmodes & modeBit) != 0) != modeSign)
+                        {
+                          if (modeSign)
+                          {
+                            chan.bmodes |= modeBit;
+                            echoModeAdded ~= c;
+                          }
+                          else
+                          {
+                            chan.bmodes &= ~modeBit;
+                            echoModeRemoved ~= c;
+                          }
+                        }
+                        break;
+                      case 'b':
+                        if (iModeArg > words.length)
+                        {
+                          if (!bansShown)
+                          {
+                            /* List bans */
+                            /* RPL_BANLIST */
+                            foreach (ban; chan.bans)
+                              user.txsn!"367 %s %s %s"(target, ban);
+                            /* RPL_ENDOFBANLIST */
+                            user.txsn!"368 %s %s :End of channel ban list"(target);
+                            bansShown = true;
+                          }
+                        }
+                        else
+                        {
+                          auto ban = words[iModeArg++];
+                          auto foundBan = std.algorithm.find(chan.bans, ban);
+                          if ((foundBan.length != 0) != modeSign)
+                          {
+                            chan.bans ~= ban;
+                            echoBansAdded ~= ban;
+                          }
+                        }
+                      break;
+                      default:
+                        /* ERR_UNKNOWNMODE */
+                        user.txsn!"472 %s %c :is unknown mode char to %s"(c, softwareFullname);
+                    }
                   }
 
-                  switch (mode)
-                  {
-                    /* RPL_BANLIST */
-                    case "+b":
-                      foreach (ban; chan.bans)
-                        txsn!"367 %s %s %s"(target, ban);
-                      break;
-                    case "+n":
-                    case "-n":
-                      user.channels[target].chan.setBooleanMode(user, Channel.MODE_n, modeOn);
-                      break;
-                    case "+t":
-                    case "-t":
-                      user.channels[target].chan.setBooleanMode(user, Channel.MODE_t, modeOn);
-                      break;
-                    case "+s":
-                    case "-s":
-                      user.channels[target].chan.setBooleanMode(user, Channel.MODE_s, modeOn);
-                      break;
-                    case "+m":
-                    case "-m":
-                      user.channels[target].chan.setBooleanMode(user, Channel.MODE_m, modeOn);
-                      break;
-                    case "+i":
-                    case "-i":
-                      user.channels[target].chan.setBooleanMode(user, Channel.MODE_i, modeOn);
-                      break;
-                    default:
-                      sendMessage("NOTICE", "Sorry, that invocation of MODE has not been implemented.");
-                      break;
-                  }
+                  chan.readUsers.txum!"PRIVMSG %s :I changed da mode!"(user, chan.name);
+                  pragma(msg, "isForwardRange ", isForwardRange!(typeof(chan.readUsers)));
+                  pragma(msg, "ElementType ", ElementType!(typeof(chan.readUsers)));
                   break;
                 }
 
-                if (words.length >= 3)
+                /*auto subject = words[3];
+
+                if (words.length == 4)
                 {
-                  auto mode = words[2];
                   switch (mode)
                   {
                     case "+o":
                     case "-o":
-                      if (words[3] in usersByNick) {
-                        auto ouiid = usersByNick[words[3]].iid;
-                        if (ouiid in uc.chan.users) {
+                      if (subject in usersByNick) {
+                        auto subjectIid = usersByNick[words[3]].iid;
+                        if (subjectIid in chan.users) {
                           auto giveOps = words[2][0] == '+';
-                          uc.chan.users[ouiid].channelOperator = giveOps;
-                          foreach (u2; uc.chan.users.values)
+                          chan.users[subjectIid].channelOperator = giveOps;
+                          foreach (u2; chan.users.values)
                             tx352(u2.user, uc);
                         }
                       }
                       break;
-                      }
-                }
-              }
-            }
-            
-            if (words[1] in user.channels) {
-              auto uc = user.channels[words[1]];
-              /* Channel Mode message, section 3.2.3 RFC2812 */
-              if (words.length == 4)
-              switch (words[2]) {
-                case "+o":
-                case "-o":
-                  if (words[3] in usersByNick) {
-                    auto ouiid = usersByNick[words[3]].iid;
-                    if (ouiid in uc.chan.users) {
-                      auto giveOps = words[2][0] == '+';
-                      uc.chan.users[ouiid].channelOperator = giveOps;
-                      foreach (u2; uc.chan.users.values)
-                        tx352(u2.user, uc);
-                    }
+                    default:
+                      sendMessage("NOTICE", "Sorry, that invocation of MODE has not been implemented.");
                   }
                   break;
-                default:
-                  sendMessage("NOTICE", "Sorry, that invocation of MODE has not been implemented.");
-              }
-              else if (words.length == 2) {
-                auto target = words[1];
-
-                if (target[0] == '#') {
                 }
-                else
-                  sendMessage("NOTICE", "Sorry, that invocation of MODE has not been implemented.");
-              }
-              else
                 sendMessage("NOTICE", "Sorry, that invocation of MODE has not been implemented.");
+                break;*/
+                assert(0, "AAA499");
+              }
             }
-            else
-              sendMessage("NOTICE", "Sorry, that invocation of MODE has not been implemented.");
+            sendMessage("NOTICE", "Sorry, that invocation of MODE has not been implemented.");
             break;
+
           case "PART":
             if (words.length < 2)
               { /* TODO */ }
@@ -498,7 +528,7 @@ shared static this() {
               { /* TODO */ }
             else {
               if (!Channel.validateName(words[1])) {
-                txsn!"403 %s %s :No such channel"(words[1]);
+                user.txsn!"403 %s %s :No such channel"(words[1]);
                 break;
               }
               bool giveOps = false;
@@ -516,17 +546,17 @@ shared static this() {
                 cuser.user.send(msg);
               if (channel.topic) {
                 /* 332 RPL_TOPIC */
-                txsn!"332 %s %s :%s"(channel.name, channel.topic);
+                user.txsn!"332 %s %s :%s"(channel.name, channel.topic);
                 /* 333 RPL_TOPICWHOTIME */
-                txsn!"333 %s %s %s"(channel.name, channel.topicWhoTime);
+                user.txsn!"333 %s %s %s"(channel.name, channel.topicWhoTime);
               } else {
                 /* 331 RPL_NOTOPIC */
-                txsn!"331 %s %s :No topic set"(words[1]);
+                user.txsn!"331 %s %s :No topic set"(words[1]);
               }
-              txsn!"353 %s @ %s :%s"(channel.name, channel.names);
-              txsn!"366 %s %s :End of /NAMES list."(channel.name);
+              user.txsn!"353 %s @ %s :%s"(channel.name, channel.names);
+              user.txsn!"366 %s %s :End of /NAMES list."(channel.name);
               /* WHO response
-              txsn!"315 %s %s :End of /WHO list."(channel.name);
+              user.txsn!"315 %s %s :End of /WHO list."(channel.name);
               */
             }
             break;
@@ -535,14 +565,9 @@ shared static this() {
             { /* TODO */ }
             else {
               if (words[1] in usersByNick)
-                // TODO use txum()
-                usersByNick[words[1]].send(format(":%s!%s@%s PRIVMSG %s :%s\r\n",
-                  user.nick, user.username, user.hostname, words[1], words[2]));
+                usersByNick[words[1]].txum!"PRIVMSG %s :%s"(user, words[1], words[2]);
               else if (words[1] in channels)
-                foreach (cuser; channels[words[1]].users)
-                  if (cuser.user !is user)
-                    // XXX ASDF
-                    cuser.user.txum!"PRIVMSG %s :%s"(words[1], words[2]);
+                channels[words[1]].readUsers.txum!"PRIVMSG %s :%s"(user, words[1], words[2]);
             }
             break;
           case "PING":
@@ -551,7 +576,7 @@ shared static this() {
              * we are the one being pinged! XXX */
             if (words.length == 2) {
               /* This is how AfterNET responded... XXX TODO */
-              txsn!":%s PONG %s :%s"(words[1], words[1], words[1]);
+              user.txsn!":%s PONG %s :%s"(words[1], words[1], words[1]);
             }
             break;
           case "QUIT":
@@ -561,17 +586,17 @@ shared static this() {
           case "LIST":
             /* RPL_LISTSTART */
             /* lol what does this message even mean? silly afternet */
-            txsn!"321 %s Channel :Users  Name";
+            user.txsn!"321 %s Channel :Users  Name";
             auto channelNames = words.length == 1 ? channels.keys : words[1].split(',');
             foreach (cname; channelNames) {
               if (cname in channels) {
                 auto chan = channels[cname];
                 /* RPL_LIST */
-                txsn!"322 %s %s %d :%s"(chan.name, chan.users.length, chan.topic);
+                user.txsn!"322 %s %s %d :%s"(chan.name, chan.users.length, chan.topic);
               }
             }
             /* RPL_LISTEND */
-            txsn!"323 %s :End of /LIST";
+            user.txsn!"323 %s :End of /LIST";
             break;
           /*case "WHO":
             bool whoOps = words[$-1] == "o";
@@ -580,7 +605,7 @@ shared static this() {
               foreach (ch; channels) {
                 foreach (uc; ch.users) {
                   tx352(user, uc
-                  txsn!"352 %s %s %s %s %s %s H%sx :0 %s"
+                  user.txsn!"352 %s %s %s %s %s %s H%sx :0 %s"
                   , serverHostname
                   , user.nick
                   , ch.name
@@ -602,7 +627,7 @@ shared static this() {
                 if (mask in channels) {
                   auto ch = channels[mask];
                   foreach (uc; ch.users) {
-                    txsn!"352 %s %s %s %s %s %s H%sx :0 %s"
+                    user.txsn!"352 %s %s %s %s %s %s H%sx :0 %s"
                     , serverHostname
                     , user.nick
                     , ch.name
@@ -618,7 +643,7 @@ shared static this() {
                   foreach (ch; channels) {
                     foreach (uc; ch.users) {
                       if (uc.user.nick == mask)
-                      txsn!"352 %s %s %s %s %s %s H%sx :0 %s"
+                      user.txsn!"352 %s %s %s %s %s %s H%sx :0 %s"
                       , serverHostname
                       , user.nick
                       , ch.name
