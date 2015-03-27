@@ -1,5 +1,6 @@
 module logircd;
 import vibe.d;
+import std.stdio;
 import std.range;
 import std.array;
 import std.string;
@@ -9,6 +10,49 @@ import numerics;
 immutable string serverHostname;
 immutable string serverMessagePrefix;
 enum softwareFullname = "logircd 0.0.0";
+
+static int sentMessageCounter = 0;
+
+auto unroll(R)(R r)
+{
+  alias ET = ElementType!R;
+  alias T = ElementType!ET;
+  enum makeInputRange = isInputRange!R && isInputRange!ET;
+  static assert(makeInputRange, "Only input ranges are implemented in unroll");
+  static struct UnrollResult
+  {
+    R r;
+    ET e;
+    this(R r)
+    {
+      this.r = r;
+    }
+    static if (makeInputRange)
+    {
+      void popFront()
+      {
+        if (e.empty) {
+          e = r.front;
+          r.popFront;
+        }
+        e.popFront;
+      }
+      @property bool empty()
+      {
+        return e.empty && r.empty;
+      }
+      @property T front()
+      {
+        if (e.empty) {
+          e = r.front;
+          r.popFront;
+        }
+        return e.front;
+      }
+    }
+  }
+  return UnrollResult(r);
+}
 
 class User {
   enum MODE_a = 1;
@@ -39,7 +83,7 @@ class User {
     this.nick = "*";
   }
   void send(string msg) {
-    logInfo(format("(server) -> (%s)\t%s", nick, msg.stripRight));
+    logInfo(format("(server) -> (%s:%d)\t%s", nick, iid, msg.stripRight));
     wtask.send(msg);
   }
   void partAll() {
@@ -194,25 +238,49 @@ string coerceAscii(string s) {
 }
 
 void txsn(string fmt, T...)(User user, T a) {
-  user.send(format(serverMessagePrefix ~ fmt ~ "\r\n", user.nick, a));
+  auto FMT = serverMessagePrefix ~ fmt ~ "\r\n";
+  try { user.send(format(FMT, user.nick, a)); }
+  catch(Throwable o) {
+    writeln(o);
+    writeln("  txsn!");
+    writeln("  ", FMT);
+    writeln("  ", T.stringof, " ", a);
+  }
 }
 void txsn(string fmt, R, T...)(R users, T a)
-if (isForwardRange!R && is(ElementType!R : User))
+if (isInputRange!R && is(ElementType!R : User))
 {
+  auto FMT = serverMessagePrefix ~ fmt ~ "\r\n";
+  try {
   foreach (user; users)
-    user.send(format(serverMessagePrefix ~ fmt ~ "\r\n", user.nick, a));
+    user.send(format(FMT, user.nick, a));
+  }
+  catch(Throwable o) {
+    writeln(o);
+    writeln("  txsn!");
+    writeln("  ", FMT);
+    writeln("  ", T.stringof, " ", a);
+  }
 }
 
 void txum(string fmt, T...)(User recipient, User user, T a)
-if (T.length == 0 || !isForwardRange!(T[0]) || !is(ElementType!T : User))
+if (T.length == 0 || !isInputRange!(T[0]) || !is(ElementType!T : User))
 {
   recipient.send(format(":%s!%s@%s " ~ fmt ~ "\r\n", user.nick, user.username, user.hostname, a));
 }
 void txum(string fmt, R, T...)(R recipients, User user, T a)
-if (isForwardRange!R && is(ElementType!R : User))
+if (isInputRange!R && is(ElementType!R : User))
 {
+  sentMessageCounter++;
+  auto msg = format(":%s!%s@%s " ~ fmt ~ "\r\n", user.nick, user.username, user.hostname, a);
   foreach (recipient; recipients)
-    recipient.send(format(":%s!%s@%s " ~ fmt ~ "\r\n", user.nick, user.username, user.hostname, a));
+  {
+    if (recipient.lastSentMessageId != sentMessageCounter)
+    {
+      recipient.send(msg);
+      recipient.lastSentMessageId = sentMessageCounter;
+    }
+  }
 }
 
 /* RPL_WHOREPLY */
@@ -233,11 +301,10 @@ void tx403(User user, string channame) {
 }
 
 shared static this() {
-  serverHostname = to!string(core.stdc.stdlib.getenv("HOSTNAME"));
+  serverHostname = "logircd-server";//to!string(core.stdc.stdlib.getenv("HOSTNAME"));
   serverMessagePrefix = ":" ~ serverHostname ~ " ";
 
-  int iidCounter = 0;
-  int sentMessageCounter;
+  uint iidCounter;
   string srvCmdFmt = ":logircd %s %s :%s\r\n";
   logircd.Channel[string] channels;
   User[string] usersByNick;
@@ -261,7 +328,7 @@ shared static this() {
         auto line = cast(string) conn.readLine(4096, "\r\n");
         if (line.length == 0)
           continue;
-        logInfo(format("(server) <- (%s)\t %s", user.nick, line));
+        logInfo(format("(server) <- (%s:%d)\t %s", user.nick, user.iid, line));
         string[] words;
         words.reserve(16);
         string lineParser = line;
@@ -295,32 +362,38 @@ shared static this() {
             }
             else if (words[1] in usersByNick)
             {
-              user.txsn!"433 %s :Nick already in use."(words[1]);
+              user.txsn!"433 %s %s :Nick already in use."(words[1]);
             }
             else if (!User.validateNick(words[1])) {
               user.txsn!"432 %s %s :Erroneous nickname."(words[1]);
             }
             else
             {
+              pragma(msg,
+                "txum!",
+                user.channels.values
+                .map!"a.chan.users.values"
+                .unroll
+                .map!"a.user"
+                .stringof
+              );
+              user.channels.values
+              .map!"a.chan.users.values"
+              .unroll
+              .map!"a.user"
+              .txum!"NICK %s"(user, words[1])
+              ;
+              if (user.lastSentMessageId != sentMessageCounter)
+              {
+                user.txum!"NICK %s"(user, words[1]);
+                user.lastSentMessageId = sentMessageCounter;
+              }
+
               if (user.nick in usersByNick)
                 usersByNick.remove(user.nick);
               usersByNick[words[1]] = user;
-              // XXXASDF
-              auto msg = format(":%s!%s@%s NICK %s\r\n", user.nick, user.username, user.hostname, words[1]);
-              sentMessageCounter++;
-              user.lastSentMessageId = sentMessageCounter;
-              foreach (chan; user.channels)
-              {
-                foreach (cuser; chan.chan.users)
-                {
-                  if (cuser.user.lastSentMessageId != sentMessageCounter)
-                  {
-                    cuser.user.lastSentMessageId = sentMessageCounter;
-                    cuser.user.send(msg);
-                  }
-                }
-              }
               user.nick = words[1];
+
               //sendMessage("NOTICE", format("*** You are now known as %s", user.nick));
             }
             break;
@@ -473,8 +546,6 @@ shared static this() {
                   }
 
                   chan.readUsers.txum!"PRIVMSG %s :I changed da mode!"(user, chan.name);
-                  pragma(msg, "isForwardRange ", isForwardRange!(typeof(chan.readUsers)));
-                  pragma(msg, "ElementType ", ElementType!(typeof(chan.readUsers)));
                   break;
                 }
 
