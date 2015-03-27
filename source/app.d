@@ -491,8 +491,8 @@ shared static this() {
                   size_t iModeArg = 3;
                   bool bansShown = false;
 
-                  char[] echoModeAdded;
-                  char[] echoModeRemoved;
+                  char[] echoModesAdded;
+                  char[] echoModesRemoved;
                   string[] echoBansAdded;
                   string[] echoBansRemoved;
 
@@ -513,12 +513,12 @@ shared static this() {
                           if (modeSign)
                           {
                             modes |= modeBit;
-                            echoModeAdded ~= c;
+                            echoModesAdded ~= c;
                           }
                           else
                           {
                             modes &= ~modeBit;
-                            echoModeRemoved ~= c;
+                            echoModesRemoved ~= c;
                           }
                         }
                         break;
@@ -573,8 +573,56 @@ shared static this() {
 
                   chan.bmodes = modes;
                   chan.modeTime = core.stdc.time.time(null);
-                  // TODO MODE create proper mode change notification
-                  chan.readUsers.txum!"PRIVMSG %s :I changed da mode!"(user, chan.name);
+
+                  char[256] modeChangeFeedback;
+                  char[] mcf = modeChangeFeedback[];
+
+                  if (echoModesRemoved.length || echoBansRemoved.length)
+                  {
+                    mcf[0] = '-';
+                    mcf = mcf[1..$];
+                  }
+                  if (echoModesRemoved.length != 0)
+                  {
+                    mcf[0..echoModesRemoved.length] = echoModesRemoved;
+                    mcf = mcf[echoModesRemoved.length..$];
+                  }
+                  foreach (ban; echoBansRemoved)
+                  {
+                    mcf[0] = 'b';
+                    mcf = mcf[1..$];
+                  }
+
+                  if (echoModesAdded.length || echoBansAdded.length)
+                  {
+                    mcf[0] = '+';
+                    mcf = mcf[1..$];
+                  }
+                  if (echoModesAdded.length != 0)
+                  {
+                    mcf[0..echoModesAdded.length] = echoModesAdded;
+                    mcf = mcf[echoModesAdded.length..$];
+                  }
+                  foreach (ban; echoBansAdded)
+                  {
+                    mcf[0] = 'b';
+                    mcf = mcf[1..$];
+                  }
+
+                  foreach (ban; echoBansRemoved)
+                  {
+                    mcf[0..ban.length] = ban;
+                    mcf[ban.length] = ' '; // XXX the space isn't showing up
+                    mcf = mcf[1+ban.length..$];
+                  }
+                  foreach (ban; echoBansAdded)
+                  {
+                    mcf[0..ban.length] = ban;
+                    mcf[ban.length] = ' '; // XXX the space isn't showing up
+                    mcf = mcf[1+ban.length..$];
+                  }
+
+                  chan.readUsers.txum!"MODE %s %s"(user, chan.name, modeChangeFeedback[0 .. modeChangeFeedback.length - mcf.length]);
                   break;
                 }
 
