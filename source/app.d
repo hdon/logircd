@@ -132,6 +132,7 @@ class Channel {
   }
 
   uint bmodes;
+  ulong modeTime; // when mode was set
 
   UserChannel[uint] users;
 
@@ -464,10 +465,11 @@ shared static this() {
 
                 auto chan = channels[target];
 
-                /* RPL_CHANNELMODEIS */
+                /* XXX ??? RPL_CHANNELMODEIS Afternet and Freenode gave me 324 followed by 329 */
                 if (words.length == 2)
                 {
-                  user.txsn!"423 %s %s %s"(target, chan.modeString); 
+                  user.txsn!"324 %s %s %s"(chan.name, chan.modeString);
+                  user.txsn!"329 %s %s %s"(chan.name, chan.modeTime);
                   break;
                 }
 
@@ -500,16 +502,16 @@ shared static this() {
                         break;
                       case 'n': case 't': case 's': case 'i': case 'm':
                         auto modeBit = Channel.MODES[c];
-                        if (((chan.bmodes & modeBit) != 0) != modeSign)
+                        if (((modes & modeBit) != 0) != modeSign)
                         {
                           if (modeSign)
                           {
-                            chan.bmodes |= modeBit;
+                            modes |= modeBit;
                             echoModeAdded ~= c;
                           }
                           else
                           {
-                            chan.bmodes &= ~modeBit;
+                            modes &= ~modeBit;
                             echoModeRemoved ~= c;
                           }
                         }
@@ -545,6 +547,8 @@ shared static this() {
                     }
                   }
 
+                  chan.bmodes = modes;
+                  chan.modeTime = core.stdc.time.time(null);
                   chan.readUsers.txum!"PRIVMSG %s :I changed da mode!"(user, chan.name);
                   break;
                 }
@@ -647,7 +651,7 @@ shared static this() {
              * we are the one being pinged! XXX */
             if (words.length == 2) {
               /* This is how AfterNET responded... XXX TODO */
-              user.txsn!":%s PONG %s :%s"(words[1], words[1], words[1]);
+              user.txsn!"PONG %s :%s"(serverHostname, words[1]);
             }
             break;
           case "QUIT":
