@@ -106,11 +106,17 @@ class User {
   }
 }
 
+struct Ban {
+  string mask;
+  string authorNick;
+  ulong time;
+}
+
 class Channel {
   string name;
   string topic;
   string topicWhoTime;
-  string[] bans;
+  Ban[] bans;
 
   /* Boolean channel modes */
   enum MODE_n = 0x00000001;    /* NO_EXTERNAL_MSGS */
@@ -517,14 +523,14 @@ shared static this() {
                         }
                         break;
                       case 'b':
-                        if (iModeArg > words.length)
+                        if (iModeArg >= words.length)
                         {
                           if (!bansShown)
                           {
                             /* List bans */
                             /* RPL_BANLIST */
                             foreach (ban; chan.bans)
-                              user.txsn!"367 %s %s %s"(target, ban);
+                              user.txsn!"367 %s %s %s %s %d :Banned"(target, ban.mask, ban.authorNick, ban.time);
                             /* RPL_ENDOFBANLIST */
                             user.txsn!"368 %s %s :End of channel ban list"(target);
                             bansShown = true;
@@ -533,10 +539,28 @@ shared static this() {
                         else
                         {
                           auto ban = words[iModeArg++];
-                          auto foundBan = std.algorithm.find(chan.bans, ban);
-                          if ((foundBan.length != 0) != modeSign)
+                          bool banFound;
+                          foreach (iFoundBan, foundBan; chan.bans)
                           {
-                            chan.bans ~= ban;
+                            if (foundBan.mask == ban)
+                            {
+                              if (modeSign == false)
+                              {
+                                /* Remove the ban */
+                                if (iFoundBan < chan.bans.length-1)
+                                  chan.bans[iFoundBan] = chan.bans[$-1];
+                                chan.bans.length--;
+                                echoBansRemoved ~= ban;
+                              }
+                              else
+                                banFound = true;
+                              break;
+                            }
+                          }
+                          if (modeSign && !banFound)
+                          {
+                            /* Add the ban */
+                            chan.bans ~= Ban(ban, user.nick, core.stdc.time.time(null));
                             echoBansAdded ~= ban;
                           }
                         }
@@ -549,6 +573,7 @@ shared static this() {
 
                   chan.bmodes = modes;
                   chan.modeTime = core.stdc.time.time(null);
+                  // TODO MODE create proper mode change notification
                   chan.readUsers.txum!"PRIVMSG %s :I changed da mode!"(user, chan.name);
                   break;
                 }
