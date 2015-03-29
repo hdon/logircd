@@ -70,6 +70,7 @@ class User {
   string hostname;
   string servername;
   string realname;
+  string nickUserHost; /* nick!user@host string; updated on successful NICK */
   UserChannel[string] channels;
   Task rtask, wtask;
   /* lastSentMessageId is used to make it easier to send a message to the union set
@@ -104,19 +105,151 @@ class User {
     }
     return true;
   }
+
+  /* TODO figure out how to put the "channels" AA from the shared module initializer into a scope
+   * that is accessible here. Just moving it out causes problems with "shared." Instead, we have
+   * added the "chanPtr" argument, which should be the result of the expression "chanName in channels."
+   * Another unfortunate side-effect is returning a Channel. If a new one is created by this method,
+   * then the caller should add it to the "channels" AA.
+   */
+  Channel joinChannel(string chanName, Channel* chanPtr)
+  {
+    /* Validate user status */
+    if (!loggedin)
+    {
+      /* TODO Queue the join */
+      return null;
+    }
+
+    /* Validate channel name */
+    if (!Channel.validateName(chanName))
+    {
+      this.tx403(chanName);
+      return null;
+    }
+
+    /* New channel? */
+    bool chanExisted = chanPtr !is null;
+    Channel chan;
+    UserChannel uc;
+
+    if (chanExisted)
+    {
+      /* Is user already in channel? */
+      if (chanName in this.channels)
+      {
+        /* Do nothing */
+        logInfo("  user already in channel");
+        return null;
+      }
+
+      chan = *chanPtr;
+
+      /* This should only exist if the user has been given +i on this chan,
+       * since we have already confirmed that chanName !in this.channels
+       */
+      auto ucPtr = iid in chan.users;
+      if (ucPtr !is null)
+        uc = *ucPtr;
+
+      /* Check for invitation? */
+      if (chan.bmodes & Channel.MODE_i)
+      {
+        if (uc is null || !uc.invited)
+        {
+          /* ERR_INVITEONLYCHAN */
+          this.txsn!"473 %s %s :Cannot join channel (+i)"(chanName);
+          return null;
+        }
+      }
+
+      /* Check for ban exception */
+      bool banExcepted;
+      foreach (eban; chan.ebans)
+      {
+        if (eban.matches(this))
+        {
+          banExcepted = true;
+          break;
+        }
+      }
+
+      /* Check for bans */
+      if (!banExcepted)
+      {
+        foreach (ban; chan.bans)
+        {
+          if (ban.matches(this))
+          {
+            this.txsn!"474 %s %s :Cannot join channel (+b)"(chanName);
+            return null;
+          }
+        }
+      }
+    }
+    else
+    {
+      /* Chan doesn't exist. Create new channel */
+      chan = new logircd.Channel(chanName);
+    }
+
+    /* Fiddle with some things to officially join the user to the channel */
+    if (uc is null)
+      uc = chan.join(this);
+    else
+    {
+      uc.invited = false;
+      uc.joined = true;
+    }
+
+    if (!chanExisted)
+      uc.channelOperator = true;
+    /* Broadcast JOIN message */
+    chan.joinedUsers.txum!"JOIN %s * :%s"(this, chan.name, realname);
+    /* Send this user topic */
+    if (chan.topic) {
+      /* 332 RPL_TOPIC */
+      this.txsn!"332 %s %s :%s"(chan.name, chan.topic);
+      /* 333 RPL_TOPICWHOTIME */
+      this.txsn!"333 %s %s %s"(chan.name, chan.topicWhoTime);
+    } else {
+      /* 331 RPL_NOTOPIC */
+      this.txsn!"331 %s %s :No topic set"(chanName);
+    }
+    /* Send user NAMES */
+    this.txsn!"353 %s @ %s :%s"(chan.name, chan.names);
+    this.txsn!"366 %s %s :End of /NAMES list."(chan.name);
+    /* WHO response
+    this.txsn!"315 %s %s :End of /WHO list."(chan.name);
+    */
+
+    return chanExisted ? null : chan;
+  }
+
+  void setNick(string nick)
+  {
+    this.nick = nick;
+    this.nickUserHost = format("%s!%s@%s", nick, username, hostname);
+  }
 }
 
 struct Ban {
   string mask;
   string authorNick;
   ulong time;
+  bool matches(User user)
+  {
+    import std.path : globMatch;
+    return globMatch(user.nickUserHost, mask);
+  }
 }
 
 class Channel {
   string name;
   string topic;
   string topicWhoTime;
-  Ban[] bans;
+  Ban[string] bans; /* key = mask */
+  Ban[string] ebans; /* ban exceptions; key = mask */
 
   /* Boolean channel modes */
   enum MODE_n = 0x00000001;    /* NO_EXTERNAL_MSGS */
@@ -146,10 +279,20 @@ class Channel {
     this.name = name;
   }
   UserChannel join(User user) {
-    return
+    auto uc =
     user.channels[name] =
     users[user.iid] =
       new UserChannel(user, this);
+    uc.joined = true;
+    return uc;
+  }
+  UserChannel invite(User user) {
+    auto uc =
+    user.channels[name] =
+    users[user.iid] =
+      new UserChannel(user, this);
+    uc.invited = true;
+    return uc;
   }
   void part(User user) {
     if (user.iid in users)
@@ -183,14 +326,31 @@ class Channel {
     }
   }
 
+  void sendNAMES(User recipient) {
+    recipient.txsn!"353 %s @ %s :%s"(name, names);
+    recipient.txsn!"366 %s %s :End of /NAMES list."(name);
+  }
+
   string names() {
     return cast(string) std.array.join(map!((UserChannel uc){
       return format("%s%s", uc.channelOperator?"@":"", uc.user.nick);
     })(users.values), " ");
   }
 
-  auto readUsers() {
-    return map!((UserChannel uc){return uc.user;})(users.values);
+  auto joinedUsers() {
+    return users.values
+    .filter!((UserChannel uc){return uc.joined;})
+    .map!((UserChannel uc){return uc.user;});
+  }
+
+  auto otherJoinedUsers(User exclude) {
+    return users.values
+    .filter!((UserChannel uc){return uc.joined && uc.user !is exclude;})
+    .map!((UserChannel uc){return uc.user;});
+  }
+
+  UserChannel userJoined(uint iid) {
+    return iid in users && users[iid].joined ? users[iid] : null;
   }
 
   string modeString() {
@@ -225,6 +385,8 @@ class UserChannel {
   bool channelOperator;
   bool channelHalfOperator;
   bool channelVoice;
+  bool joined;
+  bool invited;
   this(User user, Channel chan) {
     this.user = user;
     this.chan = chan;
@@ -273,12 +435,14 @@ if (isInputRange!R && is(ElementType!R : User))
 void txum(string fmt, T...)(User recipient, User user, T a)
 if (T.length == 0 || !isInputRange!(T[0]) || !is(ElementType!T : User))
 {
+  /* TODO use user.nickUserHost */
   recipient.send(format(":%s!%s@%s " ~ fmt ~ "\r\n", user.nick, user.username, user.hostname, a));
 }
 void txum(string fmt, R, T...)(R recipients, User user, T a)
 if (isInputRange!R && is(ElementType!R : User))
 {
   sentMessageCounter++;
+  /* TODO use user.nickUserHost */
   auto msg = format(":%s!%s@%s " ~ fmt ~ "\r\n", user.nick, user.username, user.hostname, a);
   foreach (recipient; recipients)
   {
@@ -303,9 +467,13 @@ void tx352(User user, UserChannel uc) {
   );
 }
 /* ERR_NOSUCHCHANNEL */
-void tx403(User user, string channame) {
-  user.txsn!"403 %s %s :No such channel"(channame);
-}
+void tx403(User user, string channame) { user.txsn!"403 %s %s :No such channel"(channame); }
+/* ERR_NOTONCHANNEL */
+void tx442(User user, string channame) { user.txsn!"442 %s %s :You're not in that channel"(channame); }
+/* ERR_NOSUCHNICK */
+void tx401(User user, string nickname) { user.txsn!"401 %s %s :No such nick"(nickname); }
+/* ERR_NEEDMOREPARAMS */
+void tx461(User user, string command) { user.txsn!"461 %s %s :Not enough parameters"(command); }
 
 shared static this() {
   serverHostname = "logircd-server";//to!string(core.stdc.stdlib.getenv("HOSTNAME"));
@@ -399,7 +567,7 @@ shared static this() {
               if (user.nick in usersByNick)
                 usersByNick.remove(user.nick);
               usersByNick[words[1]] = user;
-              user.nick = words[1];
+              user.setNick(words[1]);
 
               //sendMessage("NOTICE", format("*** You are now known as %s", user.nick));
             }
@@ -529,7 +697,7 @@ shared static this() {
                           {
                             /* List bans */
                             /* RPL_BANLIST */
-                            foreach (ban; chan.bans)
+                            foreach (ban; chan.bans.values)
                               user.txsn!"367 %s %s %s %s %d :Banned"(target, ban.mask, ban.authorNick, ban.time);
                             /* RPL_ENDOFBANLIST */
                             user.txsn!"368 %s %s :End of channel ban list"(target);
@@ -538,30 +706,20 @@ shared static this() {
                         }
                         else
                         {
-                          auto ban = words[iModeArg++];
-                          bool banFound;
-                          foreach (iFoundBan, foundBan; chan.bans)
+                          auto banMask = words[iModeArg++];
+                          auto banPtr = banMask in chan.bans;
+                          if ((banPtr !is null) != modeSign)
                           {
-                            if (foundBan.mask == ban)
+                            if (modeSign)
                             {
-                              if (modeSign == false)
-                              {
-                                /* Remove the ban */
-                                if (iFoundBan < chan.bans.length-1)
-                                  chan.bans[iFoundBan] = chan.bans[$-1];
-                                chan.bans.length--;
-                                echoBansRemoved ~= ban;
-                              }
-                              else
-                                banFound = true;
-                              break;
+                              chan.bans[banMask] = Ban(banMask, user.nick, core.stdc.time.time(null));
+                              echoBansAdded ~= banMask;
                             }
-                          }
-                          if (modeSign && !banFound)
-                          {
-                            /* Add the ban */
-                            chan.bans ~= Ban(ban, user.nick, core.stdc.time.time(null));
-                            echoBansAdded ~= ban;
+                            else
+                            {
+                              chan.bans.remove(banMask);
+                              echoBansRemoved ~= banMask;
+                            }
                           }
                         }
                       break;
@@ -622,7 +780,7 @@ shared static this() {
                     mcf = mcf[1+ban.length..$];
                   }
 
-                  chan.readUsers.txum!"MODE %s %s"(user, chan.name, modeChangeFeedback[0 .. modeChangeFeedback.length - mcf.length]);
+                  chan.joinedUsers.txum!"MODE %s %s"(user, chan.name, modeChangeFeedback[0 .. modeChangeFeedback.length - mcf.length]);
                   break;
                 }
 
@@ -668,46 +826,57 @@ shared static this() {
               }
             }
             break;
-          case "JOIN":
-            if (!user.loggedin)
-              /* TODO */
-              break;
-            if (words.length != 2)
-              { /* TODO */ }
-            else {
-              if (!Channel.validateName(words[1])) {
-                user.txsn!"403 %s %s :No such channel"(words[1]);
+          case "INVITE":
+            if (words.length == 1)
+            {
+              /* TODO list invites */
+            }
+            else if (words.length >= 3)
+            {
+              auto targetNick = words[1];
+              auto targetChan = words[2];
+              if (targetChan !in channels)
+              {
+                user.tx403(targetChan);
                 break;
               }
-              bool giveOps = false;
-              if (words[1] !in channels) {
-                channels[words[1]] = new logircd.Channel(words[1]);
-                giveOps = true;
+              if (targetChan !in user.channels)
+              {
+                user.tx442(targetChan);
+                break;
               }
-              /* Broadcast JOIN message */
-              auto channel = channels[words[1]];
-              auto msg = format(":%s!%s@%s JOIN %s *\r\n", user.nick, user.username, user.hostname, channel.name);
-              auto uc = channel.join(user);
-              if (giveOps)
-                uc.channelOperator = true;
-              foreach (cuser; channel.users)
-                cuser.user.send(msg);
-              if (channel.topic) {
-                /* 332 RPL_TOPIC */
-                user.txsn!"332 %s %s :%s"(channel.name, channel.topic);
-                /* 333 RPL_TOPICWHOTIME */
-                user.txsn!"333 %s %s %s"(channel.name, channel.topicWhoTime);
-              } else {
-                /* 331 RPL_NOTOPIC */
-                user.txsn!"331 %s %s :No topic set"(words[1]);
+              if (targetNick !in usersByNick)
+              {
+                user.tx401(targetNick);
+                break;
               }
-              user.txsn!"353 %s @ %s :%s"(channel.name, channel.names);
-              user.txsn!"366 %s %s :End of /NAMES list."(channel.name);
-              /* WHO response
-              user.txsn!"315 %s %s :End of /WHO list."(channel.name);
-              */
+              auto targetUser = usersByNick[targetNick];
+              auto chan = channels[targetChan];
+              if (chan.userJoined(targetUser.iid) !is null)
+              {
+                /* ERR_USERONCHANNEL */
+                user.txsn!"443 %s %s %s :is already on channel"(targetNick, targetChan);
+                break;
+              }
+              /* RPL_INVITING - according to experience and alien.net.au, RFC1459 has it wrong! */
+              user.txsn!"341 %s %s %s"(targetNick, targetChan);
+              targetUser.txum!"INVITE %s %s"(user, targetNick, targetChan);
+              chan.invite(targetUser);
             }
             break;
+
+          case "JOIN":
+            if (words.length < 2)
+            {
+              /* ERR_NEEDMOREPARAMS */
+              user.tx461(words[0]);
+              break;
+            }
+            auto chan = user.joinChannel(words[1], words[1] in channels);
+            if (chan !is null)
+              channels[chan.name] = chan;
+            break;
+
           case "PRIVMSG":
             if (words.length < 3)
             { /* TODO */ }
@@ -715,7 +884,7 @@ shared static this() {
               if (words[1] in usersByNick)
                 usersByNick[words[1]].txum!"PRIVMSG %s :%s"(user, words[1], words[2]);
               else if (words[1] in channels)
-                channels[words[1]].readUsers.txum!"PRIVMSG %s :%s"(user, words[1], words[2]);
+                channels[words[1]].otherJoinedUsers(user).txum!"PRIVMSG %s :%s"(user, words[1], words[2]);
             }
             break;
           case "PING":
