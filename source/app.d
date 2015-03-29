@@ -26,6 +26,7 @@ auto unroll(R)(R r)
     this(R r)
     {
       this.r = r;
+      e = ET.init; /* this is BS XXX */
     }
     static if (makeInputRange)
     {
@@ -86,10 +87,6 @@ class User {
   void send(string msg) {
     logInfo(format("(server) -> (%s:%d)\t%s", nick, iid, msg.stripRight));
     wtask.send(msg);
-  }
-  void partAll() {
-    foreach (chan; channels)
-      chan.chan.part(this);
   }
 
   static bool validateNick(string s) {
@@ -231,6 +228,22 @@ class User {
     this.nick = nick;
     this.nickUserHost = format("%s!%s@%s", nick, username, hostname);
   }
+
+  /* command = "PART" | "QUIT" */
+  void partAll(string command, string reason) {
+    channels.values
+    .map!((UserChannel uc){return uc.chan.otherJoinedUsers(this);})
+    .unroll
+    .txum!"QUIT :%s"(this, reason)
+    ;
+
+    foreach (uc; channels)
+    {
+      /* This should ALWAYS be true! */
+      if (iid in uc.chan.users)
+        uc.chan.users.remove(iid);
+    }
+  }
 }
 
 struct Ban {
@@ -293,11 +306,6 @@ class Channel {
       new UserChannel(user, this);
     uc.invited = true;
     return uc;
-  }
-  void part(User user) {
-    if (user.iid in users)
-      users.remove(user.iid);
-    /* else TODO */
   }
 
   void setBooleanMode(User actor, uint mode, bool on)
@@ -433,7 +441,6 @@ if (isInputRange!R && is(ElementType!R : User))
 }
 
 void txum(string fmt, T...)(User recipient, User user, T a)
-if (T.length == 0 || !isInputRange!(T[0]) || !is(ElementType!T : User))
 {
   /* TODO use user.nickUserHost */
   recipient.send(format(":%s!%s@%s " ~ fmt ~ "\r\n", user.nick, user.username, user.hostname, a));
@@ -544,14 +551,6 @@ shared static this() {
             }
             else
             {
-              pragma(msg,
-                "txum!",
-                user.channels.values
-                .map!"a.chan.users.values"
-                .unroll
-                .map!"a.user"
-                .stringof
-              );
               user.channels.values
               .map!"a.chan.users.values"
               .unroll
@@ -657,12 +656,13 @@ shared static this() {
 
                   bool modeSign = true;
                   size_t iModeArg = 3;
-                  bool bansShown = false;
 
                   char[] echoModesAdded;
                   char[] echoModesRemoved;
                   string[] echoBansAdded;
                   string[] echoBansRemoved;
+                  string[] echoEBansAdded;
+                  string[] echoEBansRemoved;
 
                   foreach (c; modeOpts)
                   {
@@ -690,35 +690,35 @@ shared static this() {
                           }
                         }
                         break;
+                      case 'e':
                       case 'b':
+                        auto echoXBansAdded = c == 'b' ? &echoBansAdded : &echoEBansAdded;
+                        auto echoXBansRemoved = c == 'b' ? &echoBansRemoved : &echoEBansRemoved;
+                        auto bans = c == 'b' ? &chan.bans : &chan.ebans;
                         if (iModeArg >= words.length)
                         {
-                          if (!bansShown)
-                          {
-                            /* List bans */
-                            /* RPL_BANLIST */
-                            foreach (ban; chan.bans.values)
-                              user.txsn!"367 %s %s %s %s %d :Banned"(target, ban.mask, ban.authorNick, ban.time);
-                            /* RPL_ENDOFBANLIST */
-                            user.txsn!"368 %s %s :End of channel ban list"(target);
-                            bansShown = true;
-                          }
+                          /* List bans */
+                          /* RPL_BANLIST */
+                          foreach (ban; (*bans).values)
+                            user.txsn!"367 %s %s %s %s %d :Banned"(target, ban.mask, ban.authorNick, ban.time);
+                          /* RPL_ENDOFBANLIST */
+                          user.txsn!"368 %s %s :End of channel ban list"(target);
                         }
                         else
                         {
                           auto banMask = words[iModeArg++];
-                          auto banPtr = banMask in chan.bans;
+                          auto banPtr = banMask in *bans;
                           if ((banPtr !is null) != modeSign)
                           {
                             if (modeSign)
                             {
-                              chan.bans[banMask] = Ban(banMask, user.nick, core.stdc.time.time(null));
-                              echoBansAdded ~= banMask;
+                              (*bans)[banMask] = Ban(banMask, user.nick, core.stdc.time.time(null));
+                              *echoXBansAdded ~= banMask;
                             }
                             else
                             {
-                              chan.bans.remove(banMask);
-                              echoBansRemoved ~= banMask;
+                              (*bans).remove(banMask);
+                              *echoXBansRemoved ~= banMask;
                             }
                           }
                         }
@@ -735,7 +735,7 @@ shared static this() {
                   char[256] modeChangeFeedback;
                   char[] mcf = modeChangeFeedback[];
 
-                  if (echoModesRemoved.length || echoBansRemoved.length)
+                  if (echoModesRemoved.length || echoBansRemoved.length || echoEBansRemoved.length)
                   {
                     mcf[0] = '-';
                     mcf = mcf[1..$];
@@ -750,8 +750,13 @@ shared static this() {
                     mcf[0] = 'b';
                     mcf = mcf[1..$];
                   }
+                  foreach (ban; echoEBansRemoved)
+                  {
+                    mcf[0] = 'e';
+                    mcf = mcf[1..$];
+                  }
 
-                  if (echoModesAdded.length || echoBansAdded.length)
+                  if (echoModesAdded.length || echoBansAdded.length || echoEBansAdded.length)
                   {
                     mcf[0] = '+';
                     mcf = mcf[1..$];
@@ -766,6 +771,11 @@ shared static this() {
                     mcf[0] = 'b';
                     mcf = mcf[1..$];
                   }
+                  foreach (ban; echoEBansAdded)
+                  {
+                    mcf[0] = 'e';
+                    mcf = mcf[1..$];
+                  }
 
                   foreach (ban; echoBansRemoved)
                   {
@@ -773,7 +783,13 @@ shared static this() {
                     mcf[ban.length] = ' '; // XXX the space isn't showing up
                     mcf = mcf[1+ban.length..$];
                   }
-                  foreach (ban; echoBansAdded)
+                  foreach (ban; echoEBansRemoved)
+                  {
+                    mcf[0..ban.length] = ban;
+                    mcf[ban.length] = ' '; // XXX the space isn't showing up
+                    mcf = mcf[1+ban.length..$];
+                  }
+                  foreach (ban; echoEBansAdded)
                   {
                     mcf[0..ban.length] = ban;
                     mcf[ban.length] = ' '; // XXX the space isn't showing up
@@ -817,15 +833,30 @@ shared static this() {
 
           case "PART":
             if (words.length < 2)
-              { /* TODO */ }
-            else {
-              if (words[1] !in channels)
-                { /* TODO */ }
-              else {
-                channels[words[1]].part(user);
-              }
+            {
+              user.tx461("PART");
+              break;
             }
+
+            auto chanName = words[1];
+
+            auto ucPtr = chanName in user.channels;
+            if (ucPtr is null)
+            {
+              user.tx442(chanName);
+              break;
+            }
+
+            auto chan = (*ucPtr).chan;
+
+            //pragma(msg, (ElementType!(ReturnType!(Channel.joinedUsers))));
+            //pragma(msg, (isInputRange!(ReturnType!(Channel.joinedUsers))));
+            chan.joinedUsers.txum!"PART %s %s"(user, chanName, words.length >= 3 ? words[2] : "No reason given");
+
+            user.channels.remove(chanName);
+            chan.users.remove(user.iid);
             break;
+
           case "INVITE":
             if (words.length == 1)
             {
@@ -994,6 +1025,12 @@ shared static this() {
         receive((string s) {
           conn.write(s);
         });
+      } catch (InterruptException o) {
+        logInfo(":::wtask interrupted for %s:%d", user.nickUserHost, user.iid);
+        if (!quit) {
+          quit = true;
+          quitReason = "write task interrupted";
+        }
       } catch (Throwable o) {
         logInfo(format("Uncaught exception for %s!%s@%s in wtask: %s",
           user.nick, user.username, user.hostname, o));
@@ -1006,18 +1043,18 @@ shared static this() {
 
     scope(exit)
     {
-      foreach (ou; usersByIid.values)
-        if (ou !is user)
-          ou.send(format(":%s!%s@%s QUIT :%s", user.nick, user.username, user.hostname, quitReason));
-      user.partAll;
+      logInfo(":::scope(exit) broadcasting QUIT");
+      user.partAll("QUIT", quitReason);
+
       if (conn.connected)
         conn.close;
+
       usersByIid.remove(user.iid);
       usersByNick.remove(user.nick);
     }
 
     user.rtask.join;
-    user.wtask.join;
+    user.wtask.interrupt;
 
     logInfo(":::Reached end of connection control scope");
   });
