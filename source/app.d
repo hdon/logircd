@@ -924,7 +924,9 @@ shared static this() {
              * we are the one being pinged! XXX */
             if (words.length == 2) {
               /* This is how AfterNET responded... XXX TODO */
-              user.txsn!"PONG %s :%s"(serverHostname, words[1]);
+              user.txsn!"PONG %s :%s"(words[1]);
+            } else {
+              user.txsn!"PONG %s";
             }
             break;
           case "QUIT":
