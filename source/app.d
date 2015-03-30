@@ -4,6 +4,7 @@ import std.stdio;
 import std.range;
 import std.array;
 import std.string;
+import std.path : globMatch;
 import core.stdc.ctype;
 import numerics;
 
@@ -63,15 +64,17 @@ class User {
   enum MODE_o = 16;
   enum MODE_O = 32;
   enum MODE_s = 64;
+  uint bmodes;
 
   TCPConnection conn;
-  bool loggedin;
   string nick;
   string username;
   string hostname;
   string servername;
   string realname;
   string nickUserHost; /* nick!user@host string; updated on successful NICK */
+  bool loggedin;
+  bool ircop;
   UserChannel[string] channels;
   Task rtask, wtask;
   /* lastSentMessageId is used to make it easier to send a message to the union set
@@ -133,7 +136,8 @@ class User {
     if (chanExisted)
     {
       /* Is user already in channel? */
-      if (chanName in this.channels)
+      auto ucPtr = chanName in this.channels;
+      if (ucPtr !is null && ucPtr.joined)
       {
         /* Do nothing */
         logInfo("  user already in channel");
@@ -144,8 +148,8 @@ class User {
 
       /* This should only exist if the user has been given +i on this chan,
        * since we have already confirmed that chanName !in this.channels
+       * XXX BS
        */
-      auto ucPtr = iid in chan.users;
       if (ucPtr !is null)
         uc = *ucPtr;
 
@@ -252,7 +256,6 @@ struct Ban {
   ulong time;
   bool matches(User user)
   {
-    import std.path : globMatch;
     return globMatch(user.nickUserHost, mask);
   }
 }
@@ -418,10 +421,10 @@ void txsn(string fmt, T...)(User user, T a) {
   auto FMT = serverMessagePrefix ~ fmt ~ "\r\n";
   try { user.send(format(FMT, user.nick, a)); }
   catch(Throwable o) {
-    writeln(o);
-    writeln("  txsn!");
-    writeln("  ", FMT);
-    writeln("  ", T.stringof, " ", a);
+    logInfo("exception: %s", o);
+    logInfo("  txsn!");
+    logInfo("  ", FMT);
+    logInfo("  ", T.stringof, " ", a);
   }
 }
 void txsn(string fmt, R, T...)(R users, T a)
@@ -433,10 +436,10 @@ if (isInputRange!R && is(ElementType!R : User))
     user.send(format(FMT, user.nick, a));
   }
   catch(Throwable o) {
-    writeln(o);
-    writeln("  txsn!");
-    writeln("  ", FMT);
-    writeln("  ", T.stringof, " ", a);
+    logInfo(o);
+    logInfo("  txsn!");
+    logInfo("  ", FMT);
+    logInfo("  ", T.stringof, " ", a);
   }
 }
 
@@ -462,15 +465,22 @@ if (isInputRange!R && is(ElementType!R : User))
 }
 
 /* RPL_WHOREPLY */
-void tx352(User user, UserChannel uc) {
-  user.txsn!"352 %s %s ~%s %s %s %s H%sx :0 %s"(
-    uc.chan.name
-  , uc.user.username
-  , uc.user.hostname
-  , serverHostname
-  , uc.user.nick
-  , uc.channelOperator ? "@" : uc.channelVoice ? "+" : ""
-  , uc.user.realname
+void tx352(User recipient, User whoUser) {
+  //auto chanName = (whoUser.channels.length != 0 ? whoUser.channels[0].chan.name : "*");
+  auto chanName = "TODO-chanName";
+  auto hereOrGone = 'H';
+  auto modeString = "x"; // i think asterisk at beginning might mean ircop
+  auto hopCount = 3;
+  recipient.txsn!"352 %s %s %s %s %s %s %c%s :%d %s"(
+    chanName
+  , whoUser.username
+  , whoUser.hostname
+  , serverHostname // this would be variable if logircd could network
+  , whoUser.nick
+  , hereOrGone
+  , modeString
+  , hopCount // this would be variable if logircd could network
+  , whoUser.realname
   );
 }
 /* ERR_NOSUCHCHANNEL */
@@ -481,6 +491,8 @@ void tx442(User user, string channame) { user.txsn!"442 %s %s :You're not in tha
 void tx401(User user, string nickname) { user.txsn!"401 %s %s :No such nick"(nickname); }
 /* ERR_NEEDMOREPARAMS */
 void tx461(User user, string command) { user.txsn!"461 %s %s :Not enough parameters"(command); }
+
+struct QuitMessage { }
 
 shared static this() {
   serverHostname = "logircd-server";//to!string(core.stdc.stdlib.getenv("HOSTNAME"));
@@ -507,10 +519,13 @@ shared static this() {
     user.rtask = runTask({
       import std.stdio;
       while (!quit && conn.connected) { try {
-        auto line = cast(string) conn.readLine(4096, "\r\n");
+        auto line = cast(string) conn.readLine(4096, "\n");
         if (line.length == 0)
           continue;
-        logInfo(format("(server) <- (%s:%d)\t %s", user.nick, user.iid, line));
+        if (line[$-1] == '\r')
+          line = line[0..$-1];
+        auto log = format("(server) <- (%s:%d)\t %s", user.nick, user.iid, line);
+        logInfo(log);
         string[] words;
         words.reserve(16);
         string lineParser = line;
@@ -530,7 +545,7 @@ shared static this() {
           }
           lineParser = lineParser[n+1..$];
         }
-        writeln("command parsed: \"", std.array.join(words, "\", \""), '"');
+        logInfo("command parsed: \"", std.array.join(words, "\", \""), '"');
         switch (words[0]) {
           case "CAP":
             if (words.length == 2 && words[1] == "LS")
@@ -663,6 +678,8 @@ shared static this() {
                   string[] echoBansRemoved;
                   string[] echoEBansAdded;
                   string[] echoEBansRemoved;
+                  string[] echoOpsAdded;
+                  string[] echoOpsRemoved;
 
                   foreach (c; modeOpts)
                   {
@@ -690,6 +707,7 @@ shared static this() {
                           }
                         }
                         break;
+
                       case 'e':
                       case 'b':
                         auto echoXBansAdded = c == 'b' ? &echoBansAdded : &echoEBansAdded;
@@ -722,7 +740,30 @@ shared static this() {
                             }
                           }
                         }
+                        break;
+
+                      case 'o':
+                        if (iModeArg >= words.length)
+                        {
+                          /* Do nothing */
+                          /* Freenode and Afternet both do nothing */
+                        }
+                        else
+                        {
+                          auto targetNick = words[iModeArg++];
+                          auto targetUser = usersByNick[targetNick];
+                          auto ucPtr = targetUser.iid in chan.users;
+                          if (ucPtr !is null && ucPtr.channelOperator != modeSign)
+                          {
+                            ucPtr.channelOperator = modeSign;
+                            if (modeSign)
+                              echoOpsAdded ~= targetNick;
+                            else
+                              echoOpsRemoved ~= targetNick;
+                          }
+                        }
                       break;
+
                       default:
                         /* ERR_UNKNOWNMODE */
                         user.txsn!"472 %s %c :is unknown mode char to %s"(c, softwareFullname);
@@ -735,7 +776,9 @@ shared static this() {
                   char[256] modeChangeFeedback;
                   char[] mcf = modeChangeFeedback[];
 
-                  if (echoModesRemoved.length || echoBansRemoved.length || echoEBansRemoved.length)
+                  /* Any "-" modes? */
+                  if (echoModesRemoved.length || echoBansRemoved.length || echoEBansRemoved.length
+                  ||  echoOpsRemoved.length)
                   {
                     mcf[0] = '-';
                     mcf = mcf[1..$];
@@ -755,8 +798,15 @@ shared static this() {
                     mcf[0] = 'e';
                     mcf = mcf[1..$];
                   }
+                  foreach (op; echoOpsRemoved)
+                  {
+                    mcf[0] = 'o';
+                    mcf = mcf[1..$];
+                  }
 
-                  if (echoModesAdded.length || echoBansAdded.length || echoEBansAdded.length)
+                  /* Any "+" modes? */
+                  if (echoModesAdded.length || echoBansAdded.length || echoEBansAdded.length
+                  ||  echoOpsAdded.length)
                   {
                     mcf[0] = '+';
                     mcf = mcf[1..$];
@@ -776,55 +826,60 @@ shared static this() {
                     mcf[0] = 'e';
                     mcf = mcf[1..$];
                   }
+                  foreach (op; echoOpsAdded)
+                  {
+                    mcf[0] = 'o';
+                    mcf = mcf[1..$];
+                  }
 
+                  /* Now we can output any arguments */
                   foreach (ban; echoBansRemoved)
                   {
+                    mcf[0]=' ';mcf=mcf[1..$];
                     mcf[0..ban.length] = ban;
-                    mcf[ban.length] = ' '; // XXX the space isn't showing up
-                    mcf = mcf[1+ban.length..$];
+                    //mcf[ban.length] = ' '; // XXX the space isn't showing up
+                    mcf = mcf[ban.length..$];
                   }
                   foreach (ban; echoEBansRemoved)
                   {
+                    mcf[0]=' ';mcf=mcf[1..$];
                     mcf[0..ban.length] = ban;
-                    mcf[ban.length] = ' '; // XXX the space isn't showing up
-                    mcf = mcf[1+ban.length..$];
+                    //mcf[ban.length] = ' '; // XXX the space isn't showing up
+                    mcf = mcf[ban.length..$];
+                  }
+                  foreach (op; echoOpsRemoved)
+                  {
+                    mcf[0]=' ';mcf=mcf[1..$];
+                    mcf[0..op.length] = op;
+                    //mcf[op.length] = ' '; // XXX the space isn't showing up
+                    mcf = mcf[op.length..$];
+                  }
+                  foreach (ban; echoBansAdded)
+                  {
+                    mcf[0]=' ';mcf=mcf[1..$];
+                    mcf[0..ban.length] = ban;
+                    //mcf[ban.length] = ' '; // XXX the space isn't showing up
+                    mcf = mcf[ban.length..$];
                   }
                   foreach (ban; echoEBansAdded)
                   {
+                    mcf[0]=' ';mcf=mcf[1..$];
                     mcf[0..ban.length] = ban;
-                    mcf[ban.length] = ' '; // XXX the space isn't showing up
-                    mcf = mcf[1+ban.length..$];
+                    //mcf[ban.length] = ' '; // XXX the space isn't showing up
+                    mcf = mcf[ban.length..$];
+                  }
+                  foreach (op; echoOpsAdded)
+                  {
+                    mcf[0]=' ';mcf=mcf[1..$];
+                    mcf[0..op.length] = op;
+                    //mcf[op.length] = ' '; // XXX the space isn't showing up
+                    mcf = mcf[op.length..$];
                   }
 
                   chan.joinedUsers.txum!"MODE %s %s"(user, chan.name, modeChangeFeedback[0 .. modeChangeFeedback.length - mcf.length]);
                   break;
                 }
 
-                /*auto subject = words[3];
-
-                if (words.length == 4)
-                {
-                  switch (mode)
-                  {
-                    case "+o":
-                    case "-o":
-                      if (subject in usersByNick) {
-                        auto subjectIid = usersByNick[words[3]].iid;
-                        if (subjectIid in chan.users) {
-                          auto giveOps = words[2][0] == '+';
-                          chan.users[subjectIid].channelOperator = giveOps;
-                          foreach (u2; chan.users.values)
-                            tx352(u2.user, uc);
-                        }
-                      }
-                      break;
-                    default:
-                      sendMessage("NOTICE", "Sorry, that invocation of MODE has not been implemented.");
-                  }
-                  break;
-                }
-                sendMessage("NOTICE", "Sorry, that invocation of MODE has not been implemented.");
-                break;*/
                 assert(0, "AAA499");
               }
             }
@@ -948,75 +1003,88 @@ shared static this() {
             /* RPL_LISTEND */
             user.txsn!"323 %s :End of /LIST";
             break;
-          /*case "WHO":
-            bool whoOps = words[$-1] == "o";
-            if (words.length == 1)
-            {
-              foreach (ch; channels) {
-                foreach (uc; ch.users) {
-                  tx352(user, uc
-                  user.txsn!"352 %s %s %s %s %s %s H%sx :0 %s"
-                  , serverHostname
-                  , user.nick
-                  , ch.name
-                  , uc.user.username
-                  , uc.user.hostname
-                  , serverHostname // TODO?
-                  , uc.user.nick
-                  , uc.channelOperator ? "@":""
-                  , uc.user.realname
-                  ));
-                }
+            
+            case "WHO":
+              string[] whoMasks = words[1..$];
+              bool ircops;
+              if (whoMasks.length && whoMasks[$-1] == "o")
+              {
+                ircops = true;
+                whoMasks = whoMasks[0..$-1];
               }
-              break;
-            }
-            auto masks = words[1.. whoOps ? $-1 : $];
-            foreach (mask; masks) {
-              if (mask[0] == '#') { 
-                // channel WHO query
-                if (mask in channels) {
-                  auto ch = channels[mask];
-                  foreach (uc; ch.users) {
-                    user.txsn!"352 %s %s %s %s %s %s H%sx :0 %s"
-                    , serverHostname
-                    , user.nick
-                    , ch.name
-                    , uc.user.username
-                    , uc.user.hostname
-                    , serverHostname // TODO?
-                    , uc.user.nick
-                    , uc.channelOperator ? "@":""
-                    , uc.user.realname
-                    ));
+              if (whoMasks.length == 0)
+              {
+                whoMasks = ["*"];
+              }
+
+              sentMessageCounter++;
+              foreach (whoMask; whoMasks)
+              {
+                /* So, on AfterNet, the "channel" that gets listed seems to be arbitrary,
+                 * but the 352 replies are IN ORDER of channel. Yet, no user shares more than
+                 * one channel in common with the WHO invoker is listed more than once. I think
+                 * I can live with that behavior.
+                 */
+                /* TODO implement user mode +i */
+                Channel* chanPtr;
+                if (whoMask == "*")
+                {
+                  foreach (whoUser; usersByIid)
+                  {
+                    if (whoUser.lastSentMessageId == sentMessageCounter || (ircops && !whoUser.ircop))
+                      continue;
+                    user.tx352(whoUser);
+                    user.lastSentMessageId = sentMessageCounter;
                   }
-                } else if (mask in usersByNick) {
-                  foreach (ch; channels) {
-                    foreach (uc; ch.users) {
-                      if (uc.user.nick == mask)
-                      user.txsn!"352 %s %s %s %s %s %s H%sx :0 %s"
-                      , serverHostname
-                      , user.nick
-                      , ch.name
-                      , uc.user.username
-                      , uc.user.hostname
-                      , serverHostname // TODO?
-                      , uc.user.nick
-                    , uc.channelOperator ? "@":""
-                      , uc.user.realname
-                      ));
+                }
+                else if ((chanPtr = whoMask in channels) !is null)
+                {
+                  auto chan = *chanPtr;
+                  foreach (whoUc; chan.users)
+                  {
+                    auto whoUser = whoUc.user;
+                    if (whoUser.lastSentMessageId == sentMessageCounter)
+                      continue;
+                    if (!(ircops && !whoUser.ircop))
+                    {
+                      user.tx352(whoUser);
+                      whoUser.lastSentMessageId = sentMessageCounter;
+                    }
+                  }
+                }
+                else
+                {
+                  foreach (whoUser; usersByIid)
+                  {
+                    if (whoUser.lastSentMessageId == sentMessageCounter)
+                      continue;
+                    if (!(ircops && !whoUser.ircop)
+                    &&(globMatch(whoUser.nick, whoMask)
+                    || globMatch(whoUser.username, whoMask)
+                    || globMatch(whoUser.hostname, whoMask)
+                    ))
+                    {
+                      user.tx352(whoUser);
+                      whoUser.lastSentMessageId = sentMessageCounter;
                     }
                   }
                 }
               }
-            }
-            break;*/
+              user.txsn!"315 %s * :End of /WHO list.";
+              break;
+
           default:
             sendMessage("NOTICE", format("*** Unknown command: %s", words[0]));
             break;
         }
       } catch (Throwable o) {
-        logInfo(format("Uncaught exception for %s!%s@%s in rtask: %s",
-          user.nick, user.username, user.hostname, o));
+        logInfo("%s:%d: uncaught exception for %s:%d in rtask: %s"
+        , o.file
+        , o.line
+        , user.nickUserHost
+        , user.iid
+        , o.msg
+        );
         quit = true;
         quitReason = "Error reading from socket.";
       }
@@ -1026,6 +1094,8 @@ shared static this() {
       while (!quit && conn.connected) { try {
         receive((string s) {
           conn.write(s);
+        },(QuitMessage qm){
+          quit = true; /* should already be true, oh well */
         });
       } catch (InterruptException o) {
         logInfo(":::wtask interrupted for %s:%d", user.nickUserHost, user.iid);
@@ -1056,7 +1126,8 @@ shared static this() {
     }
 
     user.rtask.join;
-    user.wtask.interrupt;
+    user.wtask.write(QuitMessage());
+    user.wtask.join;
 
     logInfo(":::Reached end of connection control scope");
   });
