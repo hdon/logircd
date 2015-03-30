@@ -715,26 +715,7 @@ shared static this() {
                   bool modeSign = true;
                   size_t iModeArg = 3;
 
-                  /*char[] echoModesAdded;
-                  char[] echoModesRemoved;
-
-                  /*string[] echoBansAdded;
-                  string[] echoBansRemoved;
-
-                  string[] echoEBansAdded;
-                  string[] echoEBansRemoved;
-
-                  string[] echoOpsAdded;
-                  string[] echoOpsRemoved;
-
-                  string[] echoHalfOpsAdded;
-                  string[] echoHalfOpsRemoved;
-
-                  string[] echoVoicesAdded;
-                  string[] echoVoicesRemoved;*/
-
                   string[][char][bool] echoUCModesChanged;
-                  //echoUCModesChanged[true]['o'];
 
                   foreach (c; modeOpts)
                   {
