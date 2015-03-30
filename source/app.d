@@ -68,6 +68,7 @@ class User {
 
   TCPConnection conn;
   string nick;
+  string canonicalNick;
   string username;
   string hostname;
   string servername;
@@ -106,29 +107,20 @@ class User {
     return true;
   }
 
-  /* TODO figure out how to put the "channels" AA from the shared module initializer into a scope
-   * that is accessible here. Just moving it out causes problems with "shared." Instead, we have
-   * added the "chanPtr" argument, which should be the result of the expression "chanName in channels."
-   * Another unfortunate side-effect is returning a Channel. If a new one is created by this method,
-   * then the caller should add it to the "channels" AA.
-   */
-  Channel joinChannel(string chanName, Channel* chanPtr)
+  /* The second argument is XXX BULLSHIT XXX */
+  void joinChannel(string chanName, Channel[string] chans)
   {
-    /* Validate user status */
     if (!loggedin)
-    {
-      /* TODO Queue the join */
-      return null;
-    }
+      return; /* TODO Queue the join */
 
-    /* Validate channel name */
-    if (!Channel.validateName(chanName))
-    {
+    if (!Channel.validateName(chanName)) {
       this.tx403(chanName);
-      return null;
+      return;
     }
 
-    /* New channel? */
+    /* Channel exists or create it? */
+    auto canonicalChanName = chanName.toLower;
+    auto chanPtr = canonicalChanName in chans;
     bool chanExisted = chanPtr !is null;
     Channel chan;
     UserChannel uc;
@@ -136,12 +128,12 @@ class User {
     if (chanExisted)
     {
       /* Is user already in channel? */
-      auto ucPtr = chanName in this.channels;
+      auto ucPtr = canonicalChanName in this.channels;
       if (ucPtr !is null && ucPtr.joined)
       {
         /* Do nothing */
         logInfo("  user already in channel");
-        return null;
+        return;
       }
 
       chan = *chanPtr;
@@ -159,8 +151,8 @@ class User {
         if (uc is null || !uc.invited)
         {
           /* ERR_INVITEONLYCHAN */
-          this.txsn!"473 %s %s :Cannot join channel (+i)"(chanName);
-          return null;
+          this.txsn!"473 %s %s :Cannot join channel (+i)"(chan.name);
+          return;
         }
       }
 
@@ -182,8 +174,8 @@ class User {
         {
           if (ban.matches(this))
           {
-            this.txsn!"474 %s %s :Cannot join channel (+b)"(chanName);
-            return null;
+            this.txsn!"474 %s %s :Cannot join channel (+b)"(chan.name);
+            return;
           }
         }
       }
@@ -215,7 +207,7 @@ class User {
       this.txsn!"333 %s %s %s"(chan.name, chan.topicWhoTime);
     } else {
       /* 331 RPL_NOTOPIC */
-      this.txsn!"331 %s %s :No topic set"(chanName);
+      this.txsn!"331 %s %s :No topic set"(chan.name);
     }
     /* Send user NAMES */
     this.txsn!"353 %s @ %s :%s"(chan.name, chan.names);
@@ -224,12 +216,19 @@ class User {
     this.txsn!"315 %s %s :End of /WHO list."(chan.name);
     */
 
-    return chanExisted ? null : chan;
+    if (!chanExisted)
+    {
+      logInfo("  Creating channel \"%s\"", chanName);
+      logInfo("  Channel already exists? %s", ((chanName in chans) !is null) || ((canonicalChanName in chans) !is null));
+      chans[chan.canonicalName] = chan;
+    }
+    return;
   }
 
   void setNick(string nick)
   {
     this.nick = nick;
+    this.canonicalNick = nick.toLower;
     this.nickUserHost = format("%s!%s@%s", nick, username, hostname);
   }
 
@@ -262,6 +261,7 @@ struct Ban {
 
 class Channel {
   string name;
+  string canonicalName;
   string topic;
   string topicWhoTime;
   Ban[string] bans; /* key = mask */
@@ -293,10 +293,11 @@ class Channel {
 
   this(string name) {
     this.name = name;
+    canonicalName = name.toLower;
   }
   UserChannel join(User user) {
     auto uc =
-    user.channels[name] =
+    user.channels[canonicalName] =
     users[user.iid] =
       new UserChannel(user, this);
     uc.joined = true;
@@ -304,7 +305,7 @@ class Channel {
   }
   UserChannel invite(User user) {
     auto uc =
-    user.channels[name] =
+    user.channels[canonicalName] =
     users[user.iid] =
       new UserChannel(user, this);
     uc.invited = true;
@@ -468,7 +469,7 @@ if (isInputRange!R && is(ElementType!R : User))
 void tx352(User recipient, User whoUser) {
   //auto chanName = (whoUser.channels.length != 0 ? whoUser.channels[0].chan.name : "*");
   auto chanName = "TODO-chanName";
-  auto hereOrGone = 'H';
+  auto hereOrGone = 'H'; // TODO implement AWAY
   auto modeString = "x"; // i think asterisk at beginning might mean ircop
   auto hopCount = 3;
   recipient.txsn!"352 %s %s %s %s %s %s %c%s :%d %s"(
@@ -491,6 +492,8 @@ void tx442(User user, string channame) { user.txsn!"442 %s %s :You're not in tha
 void tx401(User user, string nickname) { user.txsn!"401 %s %s :No such nick"(nickname); }
 /* ERR_NEEDMOREPARAMS */
 void tx461(User user, string command) { user.txsn!"461 %s %s :Not enough parameters"(command); }
+/* ERR_CANNOTSENDTOCHAN */
+void tx404(User user, string chanName) { user.txsn!"404 %s %s :Cannot send to channel"(chanName); }
 
 struct QuitMessage { }
 
@@ -500,7 +503,7 @@ shared static this() {
 
   uint iidCounter;
   string srvCmdFmt = ":logircd %s %s :%s\r\n";
-  logircd.Channel[string] channels;
+  logircd.Channel[string] channels; // keyed by Channel.canonicalName
   User[string] usersByNick;
   User[uint] usersByIid;
 
@@ -524,8 +527,7 @@ shared static this() {
           continue;
         if (line[$-1] == '\r')
           line = line[0..$-1];
-        auto log = format("(server) <- (%s:%d)\t %s", user.nick, user.iid, line);
-        logInfo(log);
+        logInfo("(server) <- (%s:%d)\t %s", user.nick, user.iid, line);
         string[] words;
         words.reserve(16);
         string lineParser = line;
@@ -556,13 +558,22 @@ shared static this() {
             if (words.length < 2)
             {
               user.txsn!"431 %s :No nick given.";
+              break;
             }
-            else if (words[1] in usersByNick)
+
+            auto wantedNick = words[1];
+            auto canonicalWantedNick = wantedNick.toLower;
+
+            if (canonicalWantedNick in usersByNick)
             {
-              user.txsn!"433 %s %s :Nick already in use."(words[1]);
+              user.txsn!"433 %s %s :Nick already in use."(wantedNick);
+              break;
             }
-            else if (!User.validateNick(words[1])) {
-              user.txsn!"432 %s %s :Erroneous nickname."(words[1]);
+
+            if (!User.validateNick(wantedNick))
+            {
+              user.txsn!"432 %s %s :Erroneous nickname."(wantedNick);
+              break;
             }
             else
             {
@@ -570,18 +581,18 @@ shared static this() {
               .map!"a.chan.users.values"
               .unroll
               .map!"a.user"
-              .txum!"NICK %s"(user, words[1])
+              .txum!"NICK %s"(user, wantedNick)
               ;
               if (user.lastSentMessageId != sentMessageCounter)
               {
-                user.txum!"NICK %s"(user, words[1]);
+                user.txum!"NICK %s"(user, wantedNick);
                 user.lastSentMessageId = sentMessageCounter;
               }
 
-              if (user.nick in usersByNick)
-                usersByNick.remove(user.nick);
-              usersByNick[words[1]] = user;
-              user.setNick(words[1]);
+              user.setNick(wantedNick);
+              if (user.canonicalNick in usersByNick)
+                usersByNick.remove(user.canonicalNick);
+              usersByNick[user.canonicalNick] = user;
 
               //sendMessage("NOTICE", format("*** You are now known as %s", user.nick));
             }
@@ -611,28 +622,30 @@ shared static this() {
               // TODO
             }
             break;
+
           case "TOPIC":
+            auto targetName = words[1].toLower;
+            auto chanPtr = targetName in channels;
+            if (chanPtr is null)
+            {
+              user.tx403(words[1]);
+              break;
+            }
+            auto chan = *chanPtr;
             if (words.length == 2) {
               /* Retrieve topic */
-              if (words[1] in channels) {
-                auto channel = channels[words[1]];
-                if (channel.topic) {
-                  /* 332 RPL_TOPIC */
-                  user.txsn!"332 %s %s :%s"(channel.name, channel.topic);
-                  /* 333 RPL_TOPICWHOTIME */
-                  user.txsn!"333 %s %s %s"(channel.name, channel.topicWhoTime);
-                } else {
-                  /* 331 RPL_NOTOPIC */
-                  user.txsn!"331 %s %s :No topic set"(words[1]);
-                }
+              if (chan.topic) {
+                /* 332 RPL_TOPIC */
+                user.txsn!"332 %s %s :%s"(chan.name, chan.topic);
+                /* 333 RPL_TOPICWHOTIME */
+                user.txsn!"333 %s %s %s"(chan.name, chan.topicWhoTime);
+              } else {
+                /* 331 RPL_NOTOPIC */
+                user.txsn!"331 %s %s :No topic set"(chan.name);
               }
-              else user.txsn!"403 %s %s :No such channel"(words[1]);
             } else if (words.length > 2) {
               /* Set topic */
-              if (words[1] in channels) {
-                channels[words[1]].setTopic(user, words[2]);
-              }
-              else user.txsn!"403 %s %s :No such channel"(words[1]);
+              chan.setTopic(user, words[2]);
             }
             else sendMessage("NOTICE", "Sorry, logircd did not understand your TOPIC command");
             break;
@@ -641,17 +654,19 @@ shared static this() {
             if (words.length >= 2)
             {
               auto target = words[1];
+              auto canonicalTarget = target.toLower;
               /* Target is a channel? */
               if (target[0] == '#')
               {
                 /* ERR_NOSUCHCHANNEL */
-                if (target !in user.channels)
+                auto chanPtr = canonicalTarget in user.channels;
+                if (chanPtr is null)
                 {
                   user.tx403(target);
                   break;
                 }
 
-                auto chan = channels[target];
+                auto chan = (*chanPtr).chan;
 
                 /* XXX ??? RPL_CHANNELMODEIS Afternet and Freenode gave me 324 followed by 329 */
                 if (words.length == 2)
@@ -718,9 +733,9 @@ shared static this() {
                           /* List bans */
                           /* RPL_BANLIST */
                           foreach (ban; (*bans).values)
-                            user.txsn!"367 %s %s %s %s %d :Banned"(target, ban.mask, ban.authorNick, ban.time);
+                            user.txsn!"367 %s %s %s %s %d :Banned"(chan.name, ban.mask, ban.authorNick, ban.time);
                           /* RPL_ENDOFBANLIST */
-                          user.txsn!"368 %s %s :End of channel ban list"(target);
+                          user.txsn!"368 %s %s :End of channel ban list"(chan.name);
                         }
                         else
                         {
@@ -750,8 +765,9 @@ shared static this() {
                         }
                         else
                         {
-                          auto targetNick = words[iModeArg++];
+                          auto targetNick = words[iModeArg++].toLower;
                           auto targetUser = usersByNick[targetNick];
+                          targetNick = targetUser.nick;
                           auto ucPtr = targetUser.iid in chan.users;
                           if (ucPtr !is null && ucPtr.channelOperator != modeSign)
                           {
@@ -893,7 +909,7 @@ shared static this() {
               break;
             }
 
-            auto chanName = words[1];
+            auto chanName = words[1].toLower;
 
             auto ucPtr = chanName in user.channels;
             if (ucPtr is null)
@@ -906,7 +922,7 @@ shared static this() {
 
             //pragma(msg, (ElementType!(ReturnType!(Channel.joinedUsers))));
             //pragma(msg, (isInputRange!(ReturnType!(Channel.joinedUsers))));
-            chan.joinedUsers.txum!"PART %s %s"(user, chanName, words.length >= 3 ? words[2] : "No reason given");
+            chan.joinedUsers.txum!"PART %s %s"(user, chan.name, words.length >= 3 ? words[2] : "No reason given");
 
             user.channels.remove(chanName);
             chan.users.remove(user.iid);
@@ -920,33 +936,36 @@ shared static this() {
             else if (words.length >= 3)
             {
               auto targetNick = words[1];
+              auto canonicalTargetNick = targetNick.toLower;
               auto targetChan = words[2];
               if (targetChan !in channels)
               {
                 user.tx403(targetChan);
                 break;
               }
-              if (targetChan !in user.channels)
+              auto canonicalTargetChan = targetChan.toLower;
+              if (canonicalTargetChan !in user.channels)
               {
                 user.tx442(targetChan);
                 break;
               }
-              if (targetNick !in usersByNick)
+              if (canonicalTargetNick !in usersByNick)
               {
                 user.tx401(targetNick);
                 break;
               }
-              auto targetUser = usersByNick[targetNick];
-              auto chan = channels[targetChan];
+              auto targetUser = usersByNick[canonicalTargetNick];
+              targetNick = targetUser.nick;
+              auto chan = channels[canonicalTargetChan];
               if (chan.userJoined(targetUser.iid) !is null)
               {
                 /* ERR_USERONCHANNEL */
-                user.txsn!"443 %s %s %s :is already on channel"(targetNick, targetChan);
+                user.txsn!"443 %s %s %s :is already on channel"(targetNick, chan.name);
                 break;
               }
               /* RPL_INVITING - according to experience and alien.net.au, RFC1459 has it wrong! */
-              user.txsn!"341 %s %s %s"(targetNick, targetChan);
-              targetUser.txum!"INVITE %s %s"(user, targetNick, targetChan);
+              user.txsn!"341 %s %s %s"(targetNick, chan.name);
+              targetUser.txum!"INVITE %s %s"(user, targetNick, chan.name);
               chan.invite(targetUser);
             }
             break;
@@ -958,19 +977,37 @@ shared static this() {
               user.tx461(words[0]);
               break;
             }
-            auto chan = user.joinChannel(words[1], words[1] in channels);
-            if (chan !is null)
-              channels[chan.name] = chan;
+            user.joinChannel(words[1], channels);
             break;
 
           case "PRIVMSG":
             if (words.length < 3)
             { /* TODO */ }
             else {
-              if (words[1] in usersByNick)
-                usersByNick[words[1]].txum!"PRIVMSG %s :%s"(user, words[1], words[2]);
-              else if (words[1] in channels)
-                channels[words[1]].otherJoinedUsers(user).txum!"PRIVMSG %s :%s"(user, words[1], words[2]);
+              auto target = words[1].toLower;
+              auto targetUserPtr = target in usersByNick;
+              if (targetUserPtr !is null)
+              {
+                (*targetUserPtr).txum!"PRIVMSG %s :%s"(user, (*targetUserPtr).nick, words[2]);
+                break;
+              }
+              auto targetChanPtr = target in channels;
+              if (targetChanPtr !is null)
+              {
+                auto chan = *targetChanPtr;
+                auto ucPtr = user.channels[target];
+                if ((chan.bmodes & Channel.MODE_n) && (ucPtr is null || !ucPtr.joined))
+                {
+                  user.tx404(target); // TODO give reason?
+                  break;
+                }
+                if ((chan.bmodes & Channel.MODE_m) && (ucPtr is null || !ucPtr.channelVoice))
+                {
+                  user.tx404(target); // TODO give reason?
+                  break;
+                }
+                chan.otherJoinedUsers(user).txum!"PRIVMSG %s :%s"(user, chan.name, words[2]);
+              }
             }
             break;
           case "PING":
@@ -995,7 +1032,7 @@ shared static this() {
             auto channelNames = words.length == 1 ? channels.keys : words[1].split(',');
             foreach (cname; channelNames) {
               if (cname in channels) {
-                auto chan = channels[cname];
+                auto chan = channels[cname.toLower];
                 /* RPL_LIST */
                 user.txsn!"322 %s %s %d :%s"(chan.name, chan.users.length, chan.topic);
               }
@@ -1037,7 +1074,7 @@ shared static this() {
                     user.lastSentMessageId = sentMessageCounter;
                   }
                 }
-                else if ((chanPtr = whoMask in channels) !is null)
+                else if ((chanPtr = whoMask.toLower in channels) !is null)
                 {
                   auto chan = *chanPtr;
                   foreach (whoUc; chan.users)
@@ -1104,8 +1141,13 @@ shared static this() {
           quitReason = "write task interrupted";
         }
       } catch (Throwable o) {
-        logInfo(format("Uncaught exception for %s!%s@%s in wtask: %s",
-          user.nick, user.username, user.hostname, o));
+        logInfo("%s:%d: uncaught exception for %s:%d in rtask: %s"
+        , o.file
+        , o.line
+        , user.nickUserHost
+        , user.iid
+        , o.msg
+        );
         quit = true;
         quitReason = "Error writing to socket.";
       }
@@ -1122,7 +1164,7 @@ shared static this() {
         conn.close;
 
       usersByIid.remove(user.iid);
-      usersByNick.remove(user.nick);
+      usersByNick.remove(user.canonicalNick);
     }
 
     user.rtask.join;
