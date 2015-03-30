@@ -108,7 +108,7 @@ class User {
   }
 
   /* The second argument is XXX BULLSHIT XXX */
-  void joinChannel(string chanName, Channel[string] chans)
+  void joinChannel(string chanName, ref Channel[string] chans)
   {
     if (!loggedin)
       return; /* TODO Queue the join */
@@ -219,7 +219,6 @@ class User {
     if (!chanExisted)
     {
       logInfo("  Creating channel \"%s\"", chanName);
-      logInfo("  Channel already exists? %s", ((chanName in chans) !is null) || ((canonicalChanName in chans) !is null));
       chans[chan.canonicalName] = chan;
     }
     return;
@@ -466,9 +465,7 @@ if (isInputRange!R && is(ElementType!R : User))
 }
 
 /* RPL_WHOREPLY */
-void tx352(User recipient, User whoUser) {
-  //auto chanName = (whoUser.channels.length != 0 ? whoUser.channels[0].chan.name : "*");
-  auto chanName = "TODO-chanName";
+void tx352(User recipient, User whoUser, string chanName="*") {
   auto hereOrGone = 'H'; // TODO implement AWAY
   auto modeString = "x"; // i think asterisk at beginning might mean ircop
   auto hopCount = 3;
@@ -1084,7 +1081,7 @@ shared static this() {
                       continue;
                     if (!(ircops && !whoUser.ircop))
                     {
-                      user.tx352(whoUser);
+                      user.tx352(whoUser, chan.name);
                       whoUser.lastSentMessageId = sentMessageCounter;
                     }
                   }
