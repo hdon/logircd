@@ -395,7 +395,7 @@ class UserChannel {
   Channel chan;
   enum MODE_o = 1;
   enum MODE_h = 2;
-  enum MODE_v = 3;
+  enum MODE_v = 4;
   uint bmodes;
   @property bool channelOperator()            { return (bmodes & MODE_o) != 0; }
   @property bool channelHalfOperator()        { return (bmodes & MODE_h) != 0; }
@@ -783,7 +783,6 @@ shared static this() {
                           auto ucPtr = targetUser.iid in chan.users;
                           if (ucPtr !is null && ((ucPtr.bmodes & targetBit) != 0) != modeSign)
                           {
-                            ucPtr.channelOperator = modeSign;
                             echoUCModesChanged[modeSign][c] ~= targetNick;
                             if (modeSign) ucPtr.bmodes |= targetBit;
                             else          ucPtr.bmodes &= ~targetBit;
