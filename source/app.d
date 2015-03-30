@@ -491,6 +491,8 @@ void tx401(User user, string nickname) { user.txsn!"401 %s %s :No such nick"(nic
 void tx461(User user, string command) { user.txsn!"461 %s %s :Not enough parameters"(command); }
 /* ERR_CANNOTSENDTOCHAN */
 void tx404(User user, string chanName) { user.txsn!"404 %s %s :Cannot send to channel"(chanName); }
+/* ERR_ */
+void tx482(User user, string channame) { user.txsn!"482 %s %s :You're not channel operator"(channame); }
 
 struct QuitMessage { }
 
@@ -641,6 +643,19 @@ shared static this() {
                 user.txsn!"331 %s %s :No topic set"(chan.name);
               }
             } else if (words.length > 2) {
+              auto ucPtr = user.iid in chan.users;
+              /* I guess we'll block topic from being changed by outsiders if chan mode +n */
+              if ((ucPtr is null || !ucPtr.joined) && ((chan.bmodes & Channel.MODE_n) != 0))
+              {
+                user.tx442(chan.name);
+                break;
+              }
+              /* Respect chan mode +t */
+              if ((ucPtr is null || !ucPtr.joined || !ucPtr.channelOperator) && ((chan.bmodes & Channel.MODE_t) != 0))
+              {
+                user.tx482(chan.name);
+                break;
+              }
               /* Set topic */
               chan.setTopic(user, words[2]);
             }
@@ -670,6 +685,14 @@ shared static this() {
                 {
                   user.txsn!"324 %s %s %s"(chan.name, chan.modeString);
                   user.txsn!"329 %s %s %s"(chan.name, chan.modeTime);
+                  break;
+                }
+
+                /* Check for ops */
+                auto ucPtrOper = chan.canonicalName in user.channels;
+                if (ucPtrOper is null || !ucPtrOper.channelOperator)
+                {
+                  user.tx482(chan.name);
                   break;
                 }
 
@@ -992,15 +1015,15 @@ shared static this() {
               if (targetChanPtr !is null)
               {
                 auto chan = *targetChanPtr;
-                auto ucPtr = user.channels[target];
+                auto ucPtr = target in user.channels;
                 if ((chan.bmodes & Channel.MODE_n) && (ucPtr is null || !ucPtr.joined))
                 {
-                  user.tx404(target); // TODO give reason?
+                  user.tx404(chan.name); // TODO give reason?
                   break;
                 }
                 if ((chan.bmodes & Channel.MODE_m) && (ucPtr is null || !ucPtr.channelVoice))
                 {
-                  user.tx404(target); // TODO give reason?
+                  user.tx404(chan.name); // TODO give reason?
                   break;
                 }
                 chan.otherJoinedUsers(user).txum!"PRIVMSG %s :%s"(user, chan.name, words[2]);
