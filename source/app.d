@@ -393,9 +393,16 @@ class Channel {
 class UserChannel {
   User user;
   Channel chan;
-  bool channelOperator;
-  bool channelHalfOperator;
-  bool channelVoice;
+  enum MODE_o = 1;
+  enum MODE_h = 2;
+  enum MODE_v = 3;
+  uint bmodes;
+  @property bool channelOperator()            { return (bmodes & MODE_o) != 0; }
+  @property bool channelHalfOperator()        { return (bmodes & MODE_h) != 0; }
+  @property bool channelVoice()               { return (bmodes & MODE_v) != 0; }
+  @property void channelOperator(bool v)      { if (v) bmodes |= MODE_o; else bmodes &= ~MODE_o; }
+  @property void channelHalfOperator(bool v)  { if (v) bmodes |= MODE_h; else bmodes &= ~MODE_h; }
+  @property void channelVoice(bool v)         { if (v) bmodes |= MODE_v; else bmodes &= ~MODE_v; }
   bool joined;
   bool invited;
   this(User user, Channel chan) {
@@ -496,6 +503,7 @@ void tx482(User user, string channame) { user.txsn!"482 %s %s :You're not channe
 
 struct QuitMessage { }
 
+shared static string SpecialString = "<SpecialString>";
 shared static this() {
   serverHostname = "logircd-server";//to!string(core.stdc.stdlib.getenv("HOSTNAME"));
   serverMessagePrefix = ":" ~ serverHostname ~ " ";
@@ -707,14 +715,26 @@ shared static this() {
                   bool modeSign = true;
                   size_t iModeArg = 3;
 
-                  char[] echoModesAdded;
+                  /*char[] echoModesAdded;
                   char[] echoModesRemoved;
-                  string[] echoBansAdded;
+
+                  /*string[] echoBansAdded;
                   string[] echoBansRemoved;
+
                   string[] echoEBansAdded;
                   string[] echoEBansRemoved;
+
                   string[] echoOpsAdded;
                   string[] echoOpsRemoved;
+
+                  string[] echoHalfOpsAdded;
+                  string[] echoHalfOpsRemoved;
+
+                  string[] echoVoicesAdded;
+                  string[] echoVoicesRemoved;*/
+
+                  string[][char][bool] echoUCModesChanged;
+                  //echoUCModesChanged[true]['o'];
 
                   foreach (c; modeOpts)
                   {
@@ -730,23 +750,14 @@ shared static this() {
                         auto modeBit = Channel.MODES[c];
                         if (((modes & modeBit) != 0) != modeSign)
                         {
-                          if (modeSign)
-                          {
-                            modes |= modeBit;
-                            echoModesAdded ~= c;
-                          }
-                          else
-                          {
-                            modes &= ~modeBit;
-                            echoModesRemoved ~= c;
-                          }
+                          echoUCModesChanged[modeSign][c] ~= SpecialString;
+                          if (modeSign) modes |= modeBit;
+                          else          modes &= ~modeBit;
                         }
                         break;
 
                       case 'e':
                       case 'b':
-                        auto echoXBansAdded = c == 'b' ? &echoBansAdded : &echoEBansAdded;
-                        auto echoXBansRemoved = c == 'b' ? &echoBansRemoved : &echoEBansRemoved;
                         auto bans = c == 'b' ? &chan.bans : &chan.ebans;
                         if (iModeArg >= words.length)
                         {
@@ -763,21 +774,16 @@ shared static this() {
                           auto banPtr = banMask in *bans;
                           if ((banPtr !is null) != modeSign)
                           {
-                            if (modeSign)
-                            {
-                              (*bans)[banMask] = Ban(banMask, user.nick, core.stdc.time.time(null));
-                              *echoXBansAdded ~= banMask;
-                            }
-                            else
-                            {
-                              (*bans).remove(banMask);
-                              *echoXBansRemoved ~= banMask;
-                            }
+                            echoUCModesChanged[modeSign][c] ~= banMask;
+                            if (modeSign) (*bans)[banMask] = Ban(banMask, user.nick, core.stdc.time.time(null));
+                            else          (*bans).remove(banMask);
                           }
                         }
                         break;
 
                       case 'o':
+                      case 'h':
+                      case 'v':
                         if (iModeArg >= words.length)
                         {
                           /* Do nothing */
@@ -787,15 +793,19 @@ shared static this() {
                         {
                           auto targetNick = words[iModeArg++].toLower;
                           auto targetUser = usersByNick[targetNick];
+                          auto targetBit =
+                            c == 'o' ? UserChannel.MODE_o
+                          : c == 'h' ? UserChannel.MODE_h
+                          :/* == 'v'*/ UserChannel.MODE_v
+                          ;
                           targetNick = targetUser.nick;
                           auto ucPtr = targetUser.iid in chan.users;
-                          if (ucPtr !is null && ucPtr.channelOperator != modeSign)
+                          if (ucPtr !is null && ((ucPtr.bmodes & targetBit) != 0) != modeSign)
                           {
                             ucPtr.channelOperator = modeSign;
-                            if (modeSign)
-                              echoOpsAdded ~= targetNick;
-                            else
-                              echoOpsRemoved ~= targetNick;
+                            echoUCModesChanged[modeSign][c] ~= targetNick;
+                            if (modeSign) ucPtr.bmodes |= targetBit;
+                            else          ucPtr.bmodes &= ~targetBit;
                           }
                         }
                       break;
@@ -809,110 +819,38 @@ shared static this() {
                   chan.bmodes = modes;
                   chan.modeTime = core.stdc.time.time(null);
 
-                  char[256] modeChangeFeedback;
-                  char[] mcf = modeChangeFeedback[];
+                  char[] modeChangeFeedback;
 
-                  /* Any "-" modes? */
-                  if (echoModesRemoved.length || echoBansRemoved.length || echoEBansRemoved.length
-                  ||  echoOpsRemoved.length)
+                  foreach (modeSign, foo; echoUCModesChanged)
                   {
-                    mcf[0] = '-';
-                    mcf = mcf[1..$];
-                  }
-                  if (echoModesRemoved.length != 0)
-                  {
-                    mcf[0..echoModesRemoved.length] = echoModesRemoved;
-                    mcf = mcf[echoModesRemoved.length..$];
-                  }
-                  foreach (ban; echoBansRemoved)
-                  {
-                    mcf[0] = 'b';
-                    mcf = mcf[1..$];
-                  }
-                  foreach (ban; echoEBansRemoved)
-                  {
-                    mcf[0] = 'e';
-                    mcf = mcf[1..$];
-                  }
-                  foreach (op; echoOpsRemoved)
-                  {
-                    mcf[0] = 'o';
-                    mcf = mcf[1..$];
+                    bool any;
+                    foreach (modeChar, bar; foo)
+                    {
+                      if (!any)
+                      {
+                        modeChangeFeedback ~= modeSign ? '+' : '-';
+                        any = true;
+                      }
+                      modeChangeFeedback ~= modeChar;
+                    }
                   }
 
-                  /* Any "+" modes? */
-                  if (echoModesAdded.length || echoBansAdded.length || echoEBansAdded.length
-                  ||  echoOpsAdded.length)
+                  foreach (modeSign, foo; echoUCModesChanged)
                   {
-                    mcf[0] = '+';
-                    mcf = mcf[1..$];
-                  }
-                  if (echoModesAdded.length != 0)
-                  {
-                    mcf[0..echoModesAdded.length] = echoModesAdded;
-                    mcf = mcf[echoModesAdded.length..$];
-                  }
-                  foreach (ban; echoBansAdded)
-                  {
-                    mcf[0] = 'b';
-                    mcf = mcf[1..$];
-                  }
-                  foreach (ban; echoEBansAdded)
-                  {
-                    mcf[0] = 'e';
-                    mcf = mcf[1..$];
-                  }
-                  foreach (op; echoOpsAdded)
-                  {
-                    mcf[0] = 'o';
-                    mcf = mcf[1..$];
+                    foreach (modeChar, bar; foo)
+                    {
+                      foreach (baz; bar)
+                      {
+                        if (baz !is SpecialString)
+                        {
+                          modeChangeFeedback ~= ' ';
+                          modeChangeFeedback ~= baz;
+                        }
+                      }
+                    }
                   }
 
-                  /* Now we can output any arguments */
-                  foreach (ban; echoBansRemoved)
-                  {
-                    mcf[0]=' ';mcf=mcf[1..$];
-                    mcf[0..ban.length] = ban;
-                    //mcf[ban.length] = ' '; // XXX the space isn't showing up
-                    mcf = mcf[ban.length..$];
-                  }
-                  foreach (ban; echoEBansRemoved)
-                  {
-                    mcf[0]=' ';mcf=mcf[1..$];
-                    mcf[0..ban.length] = ban;
-                    //mcf[ban.length] = ' '; // XXX the space isn't showing up
-                    mcf = mcf[ban.length..$];
-                  }
-                  foreach (op; echoOpsRemoved)
-                  {
-                    mcf[0]=' ';mcf=mcf[1..$];
-                    mcf[0..op.length] = op;
-                    //mcf[op.length] = ' '; // XXX the space isn't showing up
-                    mcf = mcf[op.length..$];
-                  }
-                  foreach (ban; echoBansAdded)
-                  {
-                    mcf[0]=' ';mcf=mcf[1..$];
-                    mcf[0..ban.length] = ban;
-                    //mcf[ban.length] = ' '; // XXX the space isn't showing up
-                    mcf = mcf[ban.length..$];
-                  }
-                  foreach (ban; echoEBansAdded)
-                  {
-                    mcf[0]=' ';mcf=mcf[1..$];
-                    mcf[0..ban.length] = ban;
-                    //mcf[ban.length] = ' '; // XXX the space isn't showing up
-                    mcf = mcf[ban.length..$];
-                  }
-                  foreach (op; echoOpsAdded)
-                  {
-                    mcf[0]=' ';mcf=mcf[1..$];
-                    mcf[0..op.length] = op;
-                    //mcf[op.length] = ' '; // XXX the space isn't showing up
-                    mcf = mcf[op.length..$];
-                  }
-
-                  chan.joinedUsers.txum!"MODE %s %s"(user, chan.name, modeChangeFeedback[0 .. modeChangeFeedback.length - mcf.length]);
+                  chan.joinedUsers.txum!"MODE %s %s"(user, chan.name, modeChangeFeedback);
                   break;
                 }
 
@@ -1053,6 +991,9 @@ shared static this() {
             foreach (cname; channelNames) {
               if (cname in channels) {
                 auto chan = channels[cname.toLower];
+                /* Hide +s channels */
+                if ((chan.bmodes & Channel.MODE_s) && user.iid !in chan.users)
+                  continue;
                 /* RPL_LIST */
                 user.txsn!"322 %s %s %d :%s"(chan.name, chan.users.length, chan.topic);
               }
