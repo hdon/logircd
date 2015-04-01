@@ -7,6 +7,7 @@ import std.string;
 import std.path : globMatch;
 import core.stdc.ctype;
 import numerics;
+alias ajoin = std.array.join;
 
 immutable string serverHostname;
 immutable string serverMessagePrefix;
@@ -89,7 +90,7 @@ class User {
     this.nick = "*";
   }
   void send(string msg) {
-    logInfo(format("(server) -> (%s:%d)\t%s", nick, iid, msg.stripRight));
+    logInfo("(server) -> (%s:%d)\t%s", nick, iid, msg.stripRight);
     wtask.send(msg);
   }
 
@@ -428,10 +429,8 @@ void txsn(string fmt, T...)(User user, T a) {
   auto FMT = serverMessagePrefix ~ fmt ~ "\r\n";
   try { user.send(format(FMT, user.nick, a)); }
   catch(Throwable o) {
-    logInfo("exception: %s", o);
-    logInfo("  txsn!");
-    logInfo("  ", FMT);
-    logInfo("  ", T.stringof, " ", a);
+    logInfo("error: txsn!\"%s\"(%s)", FMT, T.stringof);
+    logInfo("  exception: %s", o);
   }
 }
 void txsn(string fmt, R, T...)(R users, T a)
@@ -443,10 +442,8 @@ if (isInputRange!R && is(ElementType!R : User))
     user.send(format(FMT, user.nick, a));
   }
   catch(Throwable o) {
-    logInfo(o);
-    logInfo("  txsn!");
-    logInfo("  ", FMT);
-    logInfo("  ", T.stringof, " ", a);
+    logInfo("error: txsn!\"%s\"(%s)", FMT, T.stringof);
+    logInfo("  exception: %s", o);
   }
 }
 
@@ -490,6 +487,8 @@ void tx352(User recipient, User whoUser, string chanName="*") {
 }
 /* ERR_NOSUCHCHANNEL */
 void tx403(User user, string channame) { user.txsn!"403 %s %s :No such channel"(channame); }
+/* ERR_USERNOTINCHANNEL */
+void tx442(User user, string channame, string nick) { user.txsn!"442 %s %s %s :They aren't on that channel"(channame, nick); }
 /* ERR_NOTONCHANNEL */
 void tx442(User user, string channame) { user.txsn!"442 %s %s :You're not in that channel"(channame); }
 /* ERR_NOSUCHNICK */
@@ -498,7 +497,7 @@ void tx401(User user, string nickname) { user.txsn!"401 %s %s :No such nick"(nic
 void tx461(User user, string command) { user.txsn!"461 %s %s :Not enough parameters"(command); }
 /* ERR_CANNOTSENDTOCHAN */
 void tx404(User user, string chanName) { user.txsn!"404 %s %s :Cannot send to channel"(chanName); }
-/* ERR_ */
+/* ERR_CHANOPRIVSNEEDED */
 void tx482(User user, string channame) { user.txsn!"482 %s %s :You're not channel operator"(channame); }
 
 struct QuitMessage { }
@@ -536,6 +535,7 @@ shared static this() {
           line = line[0..$-1];
         logInfo("(server) <- (%s:%d)\t %s", user.nick, user.iid, line);
         string[] words;
+        bool colonArg; // set to true if the last param began with a colon
         words.reserve(16);
         string lineParser = line;
         while (lineParser.length) {
@@ -550,12 +550,14 @@ shared static this() {
           if (m == n+1) {
             words ~= lineParser[m+1..$];
             lineParser.length = 0;
+            colonArg = true;
             break;
           }
           lineParser = lineParser[n+1..$];
         }
-        logInfo("command parsed: \"", std.array.join(words, "\", \""), '"');
-        switch (words[0]) {
+        logInfo("command parsed: \"%s\"", std.array.join(words, "\", \""));
+        auto cmd = words[0];
+        switch (cmd) {
           case "CAP":
             if (words.length == 2 && words[1] == "LS")
               user.txsn!"CAP %s LS :account-notify away-notify userhost-in-names";
@@ -626,6 +628,8 @@ shared static this() {
               user.txsn!"252 %s 0 :operator(s) online";
               user.txsn!"372 %s :This is the message of the day!";
               user.txum!"MODE %s +x"(user, user.nick);
+
+              user.joinChannel("#general", channels);
               // TODO
             }
             break;
@@ -838,6 +842,34 @@ shared static this() {
               }
             }
             sendMessage("NOTICE", "Sorry, that invocation of MODE has not been implemented.");
+            break;
+
+          case "KICK":
+            if (words.length <= 2)
+            {
+              user.tx461(cmd);
+              break;
+            }
+            kick(user, words[1..colonArg ? $-1 : $], colonArg ? words[$-1] : user.nick, channels, usersByNick);
+            break;
+
+          case "ISON":
+            if (words.length == 1)
+            {
+              user.tx461(cmd);
+              break;
+            }
+            auto people = 
+              words[1..$]
+              .map!((string nick) {
+                auto userPtr = nick.toLower in usersByNick;
+                return (userPtr !is null && (((*userPtr).bmodes & User.MODE_i) == 0))
+                  ? (*userPtr).nick : null;
+              })
+              .filter!"a !is null"
+              .ajoin(" ")
+              ;
+            user.txsn!"302 %s %s"(people);
             break;
 
           case "PART":
@@ -1116,4 +1148,72 @@ shared static this() {
   });
 
   logInfo("Please connect via irc client.");
+}
+
+void kick(User kicker, string[] args, string reason, Channel[string] chans, User[string] usersByNick)
+{
+  if (args.length < 2)
+  {
+    kicker.tx461("KICK");
+    return;
+  }
+  Channel[] kickChans;
+  User[] kickUsers; // maybe we'll kick a user redundantly, oh well
+  foreach (iTargetName, targetName; args)
+  {
+    if (kickUsers.length == 0 && targetName[0] == '#')
+    {
+      auto targetChanPtr = targetName in chans;
+      if (targetChanPtr is null)
+      {
+        /* ERR_NOSUCHCHANNEL */
+        kicker.tx403(targetName);
+        return;
+      }
+      kickChans ~= *targetChanPtr;
+      continue;
+    }
+
+    auto targetUserPtr = targetName in usersByNick;
+    if (targetUserPtr is null)
+    {
+      /* ERR_NOSUCHNICK */
+      kicker.tx401(targetName);
+      return;
+    }
+    kickUsers ~= *targetUserPtr;
+  }
+
+  if (kickChans.length != 1 && kickUsers.length != kickChans.length)
+  {
+    /* ERR_NEEDMOREPARAMS */
+    kicker.tx461("KICK");
+    /* This should never happen, as the loop in which we fill kickChan and kickUsers should have
+     * already bailed out if there was a problem.
+     */
+    logInfo("  KICK: hmm.. must be a bug processing KICK arguments");
+    foreach (iArg, arg; args) logInfo("  arg %d = \"%s\"", iArg, arg);
+    foreach (iKickUser, kickUser; kickUsers) logInfo("  kickUser %d = \"%s\"", iKickUser, kickUser.nickUserHost);
+    foreach (iKickChan, kickChan; kickChans) logInfo("  kickChan %d = \"%s\"", iKickChan, kickChan.name);
+    return;
+  }
+  if (kickChans.length == 1)
+  {
+    auto kickChan = kickChans[0];
+    foreach (kickUser; kickUsers)
+    {
+      kickChan.joinedUsers.txum!"KICK %s %s :%s"(kicker, kickChan.name, kickUser.nick, reason);
+      kickUser.channels.remove(kickChan.canonicalName);
+      kickChan.users.remove(kickUser.iid);
+    }
+  }
+  else
+  {
+    foreach (kickChan, kickUser; lockstep(kickChans, kickUsers))
+    {
+      kickChan.joinedUsers.txsn!"KICK %s %s :%s"(kicker, kickChan.name, kickUser.nick, reason);
+      kickUser.channels.remove(kickChan.canonicalName);
+      kickChan.users.remove(kickUser.iid);
+    }
+  }
 }
