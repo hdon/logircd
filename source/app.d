@@ -34,11 +34,12 @@ auto unroll(R)(R r)
     {
       void popFront()
       {
-        if (e.empty) {
+        if (!e.empty)
+          e.popFront;
+        while (e.empty && !r.empty) {
           e = r.front;
           r.popFront;
         }
-        e.popFront;
       }
       @property bool empty()
       {
@@ -46,10 +47,8 @@ auto unroll(R)(R r)
       }
       @property T front()
       {
-        if (e.empty) {
-          e = r.front;
-          r.popFront;
-        }
+        if (e.empty)
+          popFront;
         return e.front;
       }
     }
@@ -569,7 +568,7 @@ shared static this() {
 
     void maybeWelcomeUser()
     {
-      if (user.loggedIn)
+      if (user.loggedIn || user._nick == "*" || !user._userName)
         return;
       user.loggedIn = true;
 
@@ -636,6 +635,7 @@ shared static this() {
           {
             if (commandQueue.length >= 32)
             {
+              sendMessage("NOTICE", "Sorry, you need to NICK and USER successfully before you can use this server!");
               quit = true;
               break;
             }
@@ -1214,21 +1214,23 @@ shared static this() {
           quit = true;
           quitReason = "Error reading from socket.";
         }
-        finally
-        {
-          logInfo(":::leaving rtask scope for %s:%d", user.nick, user.iid);
-        }
       }
+      logInfo(":::leaving rtask scope for %s:%d", user.nick, user.iid);
     });
 
     user.wtask = runTask({
       while (!quit && conn.connected) { try {
-        receive((string s) {
-          conn.write(s);
-        },(QuitMessage qm){
-          logInfo(":::wtask received QuitMessage");
-          quit = true; /* should already be true, oh well */
-        });
+        logInfo(":::wtask starting for %s:%d quit = %s", user.nick, user.iid, quit);
+        receive(
+          (QuitMessage qm)
+          {
+            quit = true; /* should already be true, oh well */
+            logInfo(":::wtask received QuitMessage for %s:%d quit = %s", user.nick, user.iid, quit);
+          },
+          (string s) {
+            conn.write(s);
+          }
+        );
       } catch (InterruptException o) {
         logInfo(":::wtask interrupted for %s:%d", user.nickUserHost, user.iid);
         if (!quit) {
@@ -1252,7 +1254,7 @@ shared static this() {
 
     user.rtask.join;
     user.partAll("QUIT", quitReason);
-    user.wtask.write(QuitMessage());
+    user.wtask.send(QuitMessage());
     user.wtask.join;
 
     logInfo(":::Reached end of connection control scope");
