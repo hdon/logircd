@@ -35,21 +35,22 @@ auto unroll(R)(R r)
     {
       void popFront()
       {
-        if (!e.empty)
-          e.popFront;
-        while (e.empty && !r.empty) {
-          e = r.front;
-          r.popFront;
-        }
+        empty;
+        e.popFront;
       }
       @property bool empty()
       {
-        return e.empty && r.empty;
+        while (e.empty)
+        {
+          if (r.empty)
+            return true;
+          e = r.front;
+          r.popFront;
+        }
+        return e.empty;
       }
       @property T front()
       {
-        if (e.empty)
-          popFront;
         return e.front;
       }
     }
@@ -1071,8 +1072,8 @@ shared static this() {
                     auto modes = targetUserPtr.bmodes;
                     auto modeMask = modes.max;
                     auto modeSet = modes.init;
-                    char[] modesAdded;
-                    char[] modesRemoved;
+                    char[] modesAdded   = ['+'];
+                    char[] modesRemoved = ['-'];
                     foreach (c; words[2])
                     {
                       switch (c)
@@ -1104,12 +1105,15 @@ shared static this() {
                           }
                       }
                     }
-                    if (modesRemoved.length || modesAdded.length)
+                    logInfo("  # modes removed / added = %d / %d", modesRemoved.length-1, modesAdded.length-1);
+                    if (modesRemoved.length > 1 || modesAdded.length > 1)
                     {
-                      user.txum!"MODE %s%s "(modesRemoved, modesAdded);
+                      targetUserPtr.bmodes = modes;
+                      user.txum!"MODE %s %s%s"(user, targetUserPtr.nick, modesRemoved.length==1?"":modesRemoved, modesAdded.length==1?"":modesAdded); 
                       if (user !is *targetUserPtr)
-                        targetUserPtr.txum!"MODE %s%s "(modesRemoved, modesAdded);
+                        (*targetUserPtr).txum!"MODE %s %s%s "(*targetUserPtr, targetUserPtr.nick, modesRemoved.length==1?"":modesRemoved, modesAdded.length==1?"":modesAdded);
                     }
+                    break;
                   }
                 }
               }
