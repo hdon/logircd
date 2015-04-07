@@ -439,6 +439,7 @@ class Channel {
     if (ucPtr is null)
       return;
     users.remove(iid);
+    ucPtr.user.channels.remove(canonicalName);
     if (users.length == 0)
     {
       logInfo("  removing channel %s", name);
@@ -1599,7 +1600,7 @@ void kick(User kicker, string[] args, string reason, Channel[string] chans, User
     foreach (kickUser; kickUsers)
     {
       kickChan.joinedUsers.txum!"KICK %s %s :%s"(kicker, kickChan.name, kickUser.nick, reason);
-      kickUser.channels.remove(kickChan.canonicalName);
+      //kickUser.channels.remove(kickChan.canonicalName);
       kickChan.removeUser(kickUser.iid, chans);
     }
   }
@@ -1619,7 +1620,7 @@ void kick(User kicker, string[] args, string reason, Channel[string] chans, User
         continue;
       }
       kickChan.joinedUsers.txsn!"KICK %s %s :%s"(kicker, kickChan.name, kickUser.nick, reason);
-      kickUser.channels.remove(kickChan.canonicalName);
+      //kickUser.channels.remove(kickChan.canonicalName);
       kickChan.removeUser(kickUser.iid, chans);
     }
   }
