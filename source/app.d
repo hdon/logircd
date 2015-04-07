@@ -10,6 +10,7 @@ import numerics;
 alias ajoin = std.array.join;
 
 immutable string serverHostname;
+immutable string serverDescription;
 immutable string serverMessagePrefix;
 enum softwareFullname = "logircd 0.0.0";
 
@@ -57,14 +58,40 @@ auto unroll(R)(R r)
 }
 
 class User {
-  enum MODE_a = 1;
-  enum MODE_i = 2;
-  enum MODE_w = 4;
-  enum MODE_r = 8;
-  enum MODE_o = 16;
-  enum MODE_O = 32;
-  enum MODE_s = 64;
+  enum MODE_i = 1; /* INVISIBLE */
+  enum MODE_o = 2; /* GLOBAL_OPERATOR */
+  enum MODE_w = 4; /* WALLOPS */
+  enum MODE_s = 8; /* SERVER_NOTICES */
+  enum MODE_MAX = 8;
   uint bmodes;
+
+  static immutable uint MODES[char];
+  static immutable char SEDOM[uint];
+  static this()
+  {
+    MODES = [
+      'i': MODE_i
+    , 'o': MODE_o
+    , 'w': MODE_w
+    , 's': MODE_s
+    ];
+    SEDOM = [
+      MODE_i: 'i'
+    , MODE_o: 'o'
+    , MODE_w: 'w'
+    , MODE_s: 's'
+    ];
+  }
+  string modeString() {
+    char[32] buf;
+    size_t i;
+    buf[i++] = '+';
+    if (bmodes & MODE_i) buf[i++] = 'i';
+    if (bmodes & MODE_o) buf[i++] = 'o';
+    if (bmodes & MODE_w) buf[i++] = 'w';
+    if (bmodes & MODE_s) buf[i++] = 's';
+    return buf[0..i].idup;
+  }
 
   TCPConnection conn;
   
@@ -178,7 +205,7 @@ class User {
       /* Check for invitation? */
       if (chan.bmodes & Channel.MODE_i)
       {
-        if (uc is null || !uc.invited)
+        if (uc is null || !uc.channelInvitation)
         {
           /* ERR_INVITEONLYCHAN */
           this.txsn!"473 %s %s :Cannot join channel (+i)"(chan.name);
@@ -221,7 +248,7 @@ class User {
       uc = chan.join(this);
     else
     {
-      uc.invited = false;
+      uc.channelInvitation = false;
       uc.joined = true;
     }
 
@@ -278,6 +305,18 @@ class User {
 
   bool isAway;
   string awayMessage;
+
+  string channelsString()
+  {
+    return cast(string)
+    std.array.join(
+      channels.values
+      .filter!((UserChannel uc){return uc.joined;})
+      .map!((UserChannel uc) {
+        return uc.qualifiedString;
+      })
+    , " ");
+  }
 }
 
 struct Ban {
@@ -341,7 +380,7 @@ class Channel {
     user.channels[canonicalName] =
     users[user.iid] =
       new UserChannel(user, this);
-    uc.invited = true;
+    uc.channelInvitation = true;
     return uc;
   }
 
@@ -377,9 +416,14 @@ class Channel {
   }
 
   string names() {
-    return cast(string) std.array.join(map!((UserChannel uc){
-      return format("%s%s", uc.channelOperator?"@":"", uc.user.nick); // TODO halfop? voice?
-    })(users.values), " ");
+    return cast(string)
+    std.array.join(
+      users.values
+      .filter!((UserChannel uc){return uc.joined;})
+      .map!((UserChannel uc) {
+        return format("%s%s", uc.channelOperator?"@":"", uc.user.nick); // TODO halfop? voice?
+      })
+    , " ");
   }
 
   auto joinedUsers() {
@@ -430,18 +474,28 @@ class UserChannel {
   enum MODE_o = 1;
   enum MODE_h = 2;
   enum MODE_v = 4;
+  enum MODE_i = 8;
   uint bmodes;
   @property bool channelOperator()            { return (bmodes & MODE_o) != 0; }
   @property bool channelHalfOperator()        { return (bmodes & MODE_h) != 0; }
   @property bool channelVoice()               { return (bmodes & MODE_v) != 0; }
+  @property bool channelInvitation()          { return (bmodes & MODE_i) != 0; }
   @property void channelOperator(bool v)      { if (v) bmodes |= MODE_o; else bmodes &= ~MODE_o; }
   @property void channelHalfOperator(bool v)  { if (v) bmodes |= MODE_h; else bmodes &= ~MODE_h; }
   @property void channelVoice(bool v)         { if (v) bmodes |= MODE_v; else bmodes &= ~MODE_v; }
+  @property void channelInvitation(bool v)    { if (v) bmodes |= MODE_i; else bmodes &= ~MODE_i; }
   bool joined;
-  bool invited;
   this(User user, Channel chan) {
     this.user = user;
     this.chan = chan;
+  }
+  string qualifiedString()
+  {
+    return format("%s%s",
+      (bmodes & MODE_o) ? "@" :
+      (bmodes & MODE_h) ? "%" :
+      (bmodes & MODE_v) ? "+" :
+      "", user.nick);
   }
 }
 
@@ -534,6 +588,8 @@ void tx461(User user, string command) { user.txsn!"461 %s %s :Not enough paramet
 void tx404(User user, string chanName) { user.txsn!"404 %s %s :Cannot send to channel"(chanName); }
 /* ERR_CHANOPRIVSNEEDED */
 void tx482(User user, string channame) { user.txsn!"482 %s %s :You're not channel operator"(channame); }
+/* ERR_NOPRIVILEGES */
+void tx481(User user, string reason) { user.txsn!"482 %s :%s"(reason); }
 
 struct QuitMessage { }
 
@@ -559,6 +615,7 @@ shared static this() {
   serverHostname = (envHost is null || !envHost[0]) ?
     "logircd-server" : to!string(envHost);
   serverMessagePrefix = ":" ~ serverHostname ~ " ";
+  serverDescription = format("%s running on %s since %s", softwareFullname, serverHostname, serverCTimeStr);
   prelaunchCommands = ["USER": true, "NICK": true, "QUIT": true, "PASS": true];
 
   uint iidCounter;
@@ -653,7 +710,7 @@ shared static this() {
             lineParser = lineParser[n+1..$];
           }
           logInfo("command parsed: \"%s\"", std.array.join(words, "\", \""));
-          auto cmd = words[0];
+          auto cmd = words[0].toUpper;
           if (!user.loggedIn && cmd !in prelaunchCommands)
           {
             if (commandQueue.length >= 32)
@@ -736,7 +793,11 @@ shared static this() {
               }
               else
               {
-                user.setUser(words[1], words[2], words[3], words[4]);
+                /* words[3] is the servername requested by the user, but
+                 * for now we might as well just trust ourselves more than
+                 * the remote user :)
+                 */
+                user.setUser(words[1], words[2], serverHostname, words[4]);
                 maybeWelcomeUser;
               }
               break;
@@ -966,6 +1027,91 @@ shared static this() {
 
                   assert(0, "AAA499");
                 }
+                else
+                {
+                  /* AfterNET responds 502 "for other users" even just to query user mode,
+                   * so we will, too.
+                   */
+                  if (canonicalTarget != user.canonicalNick && (user.bmodes & User.MODE_o) != 0)
+                  {
+                    /* ERR_USERSDONTMATCH */
+                    user.txsn!"502 %s :Can't change mode for other users";
+                    break;
+                  }
+                  auto targetUserPtr =
+                    canonicalTarget == user.canonicalNick ?
+                    &user : (canonicalTarget in usersByNick);
+                  if (targetUserPtr is null)
+                  {
+                    user.tx401(target);
+                  }
+                  if (words.length == 2)
+                  {
+                    /* So according to RFC 1459 and experience, MODE command with
+                     * a single argument specifies the target. In this case, we've
+                     * determined the target is a user. However, the only response
+                     * I have found is 221 RPL_UMODEIS, which doesn't supply a field
+                     * for the target's nick. The user's own nick appears as part of
+                     * the full message, but not necessarily as part of the actual
+                     * response to MODE. Therefore, for MODE query right now, I am
+                     * going to send a different message if the user is not targeting
+                     * himself.
+                     */
+                    if (user is *targetUserPtr)
+                      /* 221 RPL_UMODEIS */
+                      user.txsn!"221 %s %s"(user.modeString);
+                    else
+                      user.txsn!"NOTICE %s :%s has mode %s"(targetUserPtr.nick, targetUserPtr.modeString);
+                    break;
+                  }
+                  else
+                  {
+                    /* Change user mode */
+                    bool modeSign = true;
+                    auto modes = targetUserPtr.bmodes;
+                    auto modeMask = modes.max;
+                    auto modeSet = modes.init;
+                    char[] modesAdded;
+                    char[] modesRemoved;
+                    foreach (c; words[2])
+                    {
+                      switch (c)
+                      {
+                        case '+': modeSign = true;  break;
+                        case '-': modeSign = false; break;
+                        case 'o': user.tx481("You cannot become IRC operator this way :P"); break;
+                        default:
+                          auto modeBitPtr = c in User.MODES;
+                          if (modeBitPtr is null)
+                          {
+                            user.txsn!"501 %s %c :Unknown user MODE flag"(c);
+                          }
+                          else
+                          {
+                            if (((modes & *modeBitPtr) != 0) != modeSign)
+                            {
+                              if (modeSign)
+                              {
+                                modes |=  *modeBitPtr;
+                                modesAdded ~= c;
+                              }
+                              else
+                              {
+                                modes &= ~*modeBitPtr;
+                                modesRemoved ~= c;
+                              }
+                            }
+                          }
+                      }
+                    }
+                    if (modesRemoved.length || modesAdded.length)
+                    {
+                      user.txum!"MODE %s%s "(modesRemoved, modesAdded);
+                      if (user !is *targetUserPtr)
+                        targetUserPtr.txum!"MODE %s%s "(modesRemoved, modesAdded);
+                    }
+                  }
+                }
               }
               sendMessage("NOTICE", "Sorry, that invocation of MODE has not been implemented.");
               break;
@@ -1017,7 +1163,7 @@ shared static this() {
                 words[1..$]
                 .map!((string nick) {
                   auto userPtr = nick.toLower in usersByNick;
-                  return (userPtr !is null && (((*userPtr).bmodes & User.MODE_i) == 0))
+                  return (userPtr !is null && (((*userPtr).bmodes & UserChannel.MODE_i) == 0))
                     ? (*userPtr).nick : null;
                 })
                 .filter!"a !is null"
@@ -1242,6 +1388,64 @@ shared static this() {
                 }
                 user.txsn!"315 %s * :End of /WHO list.";
                 break;
+
+            case "WHOIS":
+              if (words.length < 2)
+              {
+                /* ERR_NEEDMOREPARAMS */
+                user.tx461(words[0]);
+                break;
+              }
+              /* We ignore the server argument for now */
+              auto targetNick = (words.length == 2 ? words[1] : words[2]).toLower;
+              auto targetUserPtr = targetNick in usersByNick;
+              if (targetUserPtr is null)
+              {
+                /* ERR_NOSUCHNICK */
+                user.tx401(targetNick);
+                break;
+              }
+              /* 311 RPL_WHOISUSER */
+              user.txsn!"311 %s %s %s %s * :%s"(
+                targetUserPtr.nick
+              , targetUserPtr.username
+              , targetUserPtr.hostname
+              , targetUserPtr.realname
+              );
+              /* 319 RPL_WHOISCHANNELS */
+              user.txsn!"319 %s %s :%s"(
+                targetUserPtr.nick
+              , targetUserPtr.channelsString
+              );
+              /* 312 RPL_WHOISSERVER */
+              user.txsn!"312 %s %s %s :%s"(
+                targetUserPtr.nick
+              , targetUserPtr.servername
+              , serverHostname
+              , serverDescription
+              );
+              /* 330 seems to be in contention, meh */
+              /* 318 RPL_ENDOFWHOIS */
+              user.txsn!"318 %s %s :End of /WHOIS list."(targetUserPtr.nick);
+              break;
+
+            case "LOLBECOMEOP":
+              if (words.length < 2)
+              {
+                /* ERR_NEEDMOREPARAMS */
+                user.tx461(words[0]);
+                break;
+              }
+              auto chanName = words[1].toLower;
+              auto ucPtr = user.channels[chanName];
+              if (ucPtr is null || !ucPtr.joined)
+              {
+                user.joinChannel(chanName, channels);
+                ucPtr = user.channels[chanName];
+              }
+              ucPtr.bmodes |= UserChannel.MODE_o;
+              ucPtr.chan.joinedUsers.txum!"MODE %s +o %s"(user, ucPtr.chan.name, user.nick);
+              break;
 
             default:
               sendMessage("NOTICE", format("*** Unknown command: %s", words[0]));
