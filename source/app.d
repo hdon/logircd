@@ -228,7 +228,10 @@ class User {
     if (!chanExisted)
       uc.channelOperator = true;
     /* Broadcast JOIN message */
-    chan.joinedUsers.txum!"JOIN %s"(this, chan.name);
+    if (chan.bmodes & Channel.MODE_a)
+      this.txum!"JOIN %s"(this, chan.name);
+    else
+      chan.joinedUsers.txum!"JOIN %s"(this, chan.name);
     /* Send this user topic */
     if (chan.topic) {
       /* 332 RPL_TOPIC */
@@ -240,7 +243,10 @@ class User {
       this.txsn!"331 %s %s :No topic set"(chan.name);
     }
     /* Send user NAMES */
-    this.txsn!"353 %s @ %s :%s"(chan.name, chan.names);
+    if (chan.bmodes & Channel.MODE_a)
+      this.txsn!"353 %s @ %s :%s"(chan.name, this.nick); // TODO op? halfop? voice?
+    else
+      this.txsn!"353 %s @ %s :%s"(chan.name, chan.names);
     this.txsn!"366 %s %s :End of /NAMES list."(chan.name);
     /* WHO response
     this.txsn!"315 %s %s :End of /WHO list."(chan.name);
@@ -298,6 +304,7 @@ class Channel {
   enum MODE_s = 0x00000004;    /* SECRET */
   enum MODE_i = 0x00000008;    /* INVITE */
   enum MODE_m = 0x00000010;    /* MODERATED */
+  enum MODE_a = 0x00000020;    /* ANONYMOUS */
   static immutable uint MODES[char];
 
   static this()
@@ -308,6 +315,7 @@ class Channel {
     , 's': MODE_s
     , 'i': MODE_i
     , 'm': MODE_m
+    , 'a': MODE_a
     ];
   }
 
@@ -370,7 +378,7 @@ class Channel {
 
   string names() {
     return cast(string) std.array.join(map!((UserChannel uc){
-      return format("%s%s", uc.channelOperator?"@":"", uc.user.nick);
+      return format("%s%s", uc.channelOperator?"@":"", uc.user.nick); // TODO halfop? voice?
     })(users.values), " ");
   }
 
@@ -472,6 +480,8 @@ if (isInputRange!R && is(ElementType!R : User))
   }
 }
 
+User ModeAUser;
+
 void txum(string fmt, T...)(User recipient, User user, T a)
 {
   /* TODO use user.nickUserHost */
@@ -530,7 +540,11 @@ struct QuitMessage { }
 immutable bool[string] prelaunchCommands;
 shared static string SpecialString = "<SpecialString>";
 shared static this() {
-  import std.stdio : writeln;
+  /* So, the actual format we get with this code is: Fri Apr 03 2015 at 13:32:34 PDT
+   * but AfterNet gives me Sat Jul 5 2014 at 23:39:00 EDT. The subtle difference being
+   * that the day-of-the-month is not zero-padded by AfterNet. For now, I'm just gonna
+   * leave it like this and assume it will work. *cross fingers*
+   */
   auto serverCTime = core.stdc.time.time(null);
   auto serverCTimeTm = core.stdc.time.localtime(&serverCTime);
   char[] buf = new char[200];
@@ -539,20 +553,29 @@ shared static this() {
     throw new Exception("strftime() buf size too large");
   auto serverCTimeStr = buf[0..serverCTimeStrLen];
   buf = null;
-  /* So, the actual format we get with this code is: Fri Apr 03 2015 at 13:32:34 PDT
-   * but AfterNet gives me Sat Jul 5 2014 at 23:39:00 EDT. The subtle difference being
-   * that the day-of-the-month is not zero-padded by AfterNet. For now, I'm just gonna
-   * leave it like this and assume it will work. *cross fingers*
-   */
-  serverHostname = "logircd-server";//to!string(core.stdc.stdlib.getenv("HOSTNAME"));
+
+  /* Pick a good default server name, until we have conf file */
+  auto envHost = core.stdc.stdlib.getenv("HOSTNAME");
+  serverHostname = (envHost is null || !envHost[0]) ?
+    "logircd-server" : to!string(envHost);
   serverMessagePrefix = ":" ~ serverHostname ~ " ";
   prelaunchCommands = ["USER": true, "NICK": true, "QUIT": true, "PASS": true];
 
   uint iidCounter;
-  string srvCmdFmt = ":logircd %s %s :%s\r\n";
+  string srvCmdFmt = ":logircd %s %s :%s\r\n"; // TODO this will be removed soon
   logircd.Channel[string] channels; // keyed by Channel.canonicalName
   User[string] usersByNick;
   User[uint] usersByIid;
+
+  ModeAUser = new logircd.User(null, iidCounter++);
+  ModeAUser._serverName = serverHostname;
+  ModeAUser._nick =
+  ModeAUser._canonicalNick =
+  ModeAUser._userName =
+  ModeAUser._hostName =
+  ModeAUser._realName =
+  ModeAUser._nick =
+  ModeAUser._canonicalNick = "somebody";
 
   listenTCP(6667, (conn) {
     logInfo("New client!");
@@ -815,7 +838,7 @@ shared static this() {
                         case '-':
                           modeSign = false;
                           break;
-                        case 'n': case 't': case 's': case 'i': case 'm':
+                        case 'n': case 't': case 's': case 'i': case 'm': case 'a':
                           auto modeBit = Channel.MODES[c];
                           if (((modes & modeBit) != 0) != modeSign)
                           {
@@ -881,6 +904,25 @@ shared static this() {
                         default:
                           /* ERR_UNKNOWNMODE */
                           user.txsn!"472 %s %c :is unknown mode char to %s"(c, softwareFullname);
+                      }
+                    }
+
+                    /* Sometimes we need to do more when a mode changes. */
+                    if ((chan.bmodes ^ modes) & Channel.MODE_a)
+                    {
+                      if (modes & Channel.MODE_a)
+                      {
+                        foreach (uc; chan.users)
+                        {
+                          chan.otherJoinedUsers(uc.user).txum!"PART %s %s"(uc.user, chan.name, "channel MODE +a");
+                        }
+                      }
+                      else
+                      {
+                        foreach (uc; chan.users)
+                        {
+                          chan.otherJoinedUsers(uc.user).txum!"JOIN %s"(uc.user, chan.name);
+                        }
                       }
                     }
 
@@ -1004,7 +1046,8 @@ shared static this() {
 
               //pragma(msg, (ElementType!(ReturnType!(Channel.joinedUsers))));
               //pragma(msg, (isInputRange!(ReturnType!(Channel.joinedUsers))));
-              chan.joinedUsers.txum!"PART %s %s"(user, chan.name, words.length >= 3 ? words[2] : "No reason given");
+              if ((chan.bmodes & Channel.MODE_a) == 0)
+                chan.joinedUsers.txum!"PART %s %s"(user, chan.name, words.length >= 3 ? words[2] : "No reason given");
 
               user.channels.remove(chanName);
               chan.users.remove(user.iid);
@@ -1090,7 +1133,10 @@ shared static this() {
                     user.tx404(chan.name); // TODO give reason?
                     break;
                   }
-                  chan.otherJoinedUsers(user).txum!"PRIVMSG %s :%s"(user, chan.name, words[2]);
+                  if (chan.bmodes & Channel.MODE_a)
+                    chan.otherJoinedUsers(user).txum!"PRIVMSG %s :%s"(ModeAUser, chan.name, words[2]);
+                  else
+                    chan.otherJoinedUsers(user).txum!"PRIVMSG %s :%s"(user, chan.name, words[2]);
                 }
               }
               break;
