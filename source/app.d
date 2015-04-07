@@ -289,7 +289,7 @@ class User {
   }
 
   /* command = "PART" | "QUIT" */
-  void partAll(string command, string reason) {
+  void partAll(string command, string reason, Channel[string] chans) {
     channels.values
     .map!((UserChannel uc){return uc.chan.otherJoinedUsers(this);})
     .unroll
@@ -300,7 +300,7 @@ class User {
     {
       /* This should ALWAYS be true! */
       if (iid in uc.chan.users)
-        uc.chan.users.remove(iid);
+        uc.chan.removeUser(iid, chans);
     }
   }
 
@@ -431,6 +431,19 @@ class Channel {
     return users.values
     .filter!((UserChannel uc){return uc.joined;})
     .map!((UserChannel uc){return uc.user;});
+  }
+
+  /* Second argument is the AA of channels, keyed by canonical channel name */
+  void removeUser(uint iid, Channel[string] chans) {
+    auto ucPtr = iid in users;
+    if (ucPtr is null)
+      return;
+    users.remove(iid);
+    if (users.length == 0)
+    {
+      logInfo("  removing channel %s", name);
+      chans.remove(canonicalName);
+    }
   }
 
   auto otherJoinedUsers(User exclude) {
@@ -1199,8 +1212,9 @@ shared static this() {
               if ((chan.bmodes & Channel.MODE_a) == 0)
                 chan.joinedUsers.txum!"PART %s %s"(user, chan.name, words.length >= 3 ? words[2] : "No reason given");
 
-              user.channels.remove(chanName);
-              chan.users.remove(user.iid);
+              chan.removeUser(user.iid, channels);
+              //user.channels.remove(chanName);
+              //chan.users.remove(user.iid);
               break;
 
             case "INVITE":
@@ -1314,8 +1328,12 @@ shared static this() {
                 if (cname in channels) {
                   auto chan = channels[cname.toLower];
                   /* Hide +s channels */
-                  if ((chan.bmodes & Channel.MODE_s) && user.iid !in chan.users)
-                    continue;
+                  if ((chan.bmodes & Channel.MODE_s) != 0)
+                  {
+                    auto ucPtr = user.iid in chan.users;
+                    if (ucPtr is null || !ucPtr.joined)
+                      continue;
+                  }
                   /* RPL_LIST */
                   user.txsn!"322 %s %s %d :%s"(chan.name, chan.users.length, chan.topic);
                 }
@@ -1507,7 +1525,7 @@ shared static this() {
     sendMessage("NOTICE", "*** Welcome to the server!");
 
     user.rtask.join;
-    user.partAll("QUIT", quitReason);
+    user.partAll("QUIT", quitReason, channels);
     user.wtask.send(QuitMessage());
     user.wtask.join;
 
@@ -1582,7 +1600,7 @@ void kick(User kicker, string[] args, string reason, Channel[string] chans, User
     {
       kickChan.joinedUsers.txum!"KICK %s %s :%s"(kicker, kickChan.name, kickUser.nick, reason);
       kickUser.channels.remove(kickChan.canonicalName);
-      kickChan.users.remove(kickUser.iid);
+      kickChan.removeUser(kickUser.iid, chans);
     }
   }
   else
@@ -1602,7 +1620,7 @@ void kick(User kicker, string[] args, string reason, Channel[string] chans, User
       }
       kickChan.joinedUsers.txsn!"KICK %s %s :%s"(kicker, kickChan.name, kickUser.nick, reason);
       kickUser.channels.remove(kickChan.canonicalName);
-      kickChan.users.remove(kickUser.iid);
+      kickChan.removeUser(kickUser.iid, chans);
     }
   }
 }
