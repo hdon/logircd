@@ -9,7 +9,7 @@
 	"versions": ["VibeDefaultMain"],
   	"buildTypes": {
 		"debug": {
-			"buildOptions": ["debugMode", "debugInfo", "optimize"]
+			"buildOptions": ["debugMode", "debugInfo"]
 		},
 		"debug-profile": {
 			"buildOptions": ["debugMode", "debugInfo", "profile"]

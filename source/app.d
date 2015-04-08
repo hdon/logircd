@@ -290,18 +290,30 @@ class User {
 
   /* command = "PART" | "QUIT" */
   void partAll(string command, string reason, Channel[string] chans) {
-    channels.values
+    channels.byValue
     .map!((UserChannel uc){return uc.chan.otherJoinedUsers(this);})
     .unroll
     .txum!"%s :%s"(this, command, reason)
     ;
 
+    logInfo("  partAll() on %d channels", channels.length);
+    logInfo("  channels: %s", channels);
     foreach (uc; channels)
     {
+      logInfo("    uc = %s", to!string(uc));
       /* This should ALWAYS be true! */
-      if (iid in uc.chan.users)
-        uc.chan.removeUser(iid, chans);
+      auto ucPtr2 = iid in uc.chan.users;
+      if (ucPtr2 is null)
+      {
+        logInfo("    ucPtr2 = null!!!");
+        continue;
+      }
+      logInfo("    ucPtr2 = %s", *ucPtr2);
+      uc.chan.removeUser(iid, chans, false);
     }
+    /* Lol.. what is the idiomatic way to reinitialize 'channels' here? */
+    UserChannel[string] newChannels;
+    channels = newChannels;
   }
 
   bool isAway;
@@ -311,7 +323,7 @@ class User {
   {
     return cast(string)
     std.array.join(
-      channels.values
+      channels.byValue
       .filter!((UserChannel uc){return uc.joined;})
       .map!((UserChannel uc) {
         return uc.qualifiedString;
@@ -419,7 +431,7 @@ class Channel {
   string names() {
     return cast(string)
     std.array.join(
-      users.values
+      users.byValue
       .filter!((UserChannel uc){return uc.joined;})
       .map!((UserChannel uc) {
         return format("%s%s", uc.channelOperator?"@":"", uc.user.nick); // TODO halfop? voice?
@@ -428,18 +440,22 @@ class Channel {
   }
 
   auto joinedUsers() {
-    return users.values
+    return users.byValue
     .filter!((UserChannel uc){return uc.joined;})
     .map!((UserChannel uc){return uc.user;});
   }
 
-  /* Second argument is the AA of channels, keyed by canonical channel name */
-  void removeUser(uint iid, Channel[string] chans) {
+  /* Second argument is the AA of channels, keyed by canonical channel name.
+   * Set the third argument to false if you do not want this method to alter
+   * the corresponding User instance. Useful if iterating over User.channels.
+   */
+  void removeUser(uint iid, Channel[string] chans, bool twoWays=true) {
     auto ucPtr = iid in users;
     if (ucPtr is null)
       return;
     users.remove(iid);
-    ucPtr.user.channels.remove(canonicalName);
+    if (twoWays)
+      ucPtr.user.channels.remove(canonicalName);
     if (users.length == 0)
     {
       logInfo("  removing channel %s", name);
@@ -448,7 +464,7 @@ class Channel {
   }
 
   auto otherJoinedUsers(User exclude) {
-    return users.values
+    return users.byValue
     .filter!((UserChannel uc){return uc.joined && uc.user !is exclude;})
     .map!((UserChannel uc){return uc.user;});
   }
@@ -511,6 +527,9 @@ class UserChannel {
       (bmodes & MODE_h) ? "%" :
       (bmodes & MODE_v) ? "+" :
       "", user.nick);
+  }
+  override string toString() {
+    return format("UserChannel(user=%s:%s, chan=%s)", user.nick, user.iid, chan.name);
   }
 }
 
@@ -773,8 +792,8 @@ shared static this() {
 
               logInfo("  assigning new nick \"%s\" -> \"%s\"", user.nick, wantedNick);
 
-              user.channels.values
-              .map!"a.chan.users.values"
+              user.channels.byValue
+              .map!"a.chan.users.byValue"
               .unroll
               .map!"a.user"
               .txum!"NICK %s"(user, wantedNick)
@@ -931,7 +950,7 @@ shared static this() {
                           {
                             /* List bans */
                             /* RPL_BANLIST */
-                            foreach (ban; (*bans).values)
+                            foreach (ban; (*bans).byValue)
                               user.txsn!"367 %s %s %s %s %d :Banned"(chan.name, ban.mask, ban.authorNick, ban.time);
                             /* RPL_ENDOFBANLIST */
                             user.txsn!"368 %s %s :End of channel ban list"(chan.name);
@@ -960,19 +979,26 @@ shared static this() {
                           else
                           {
                             auto targetNick = words[iModeArg++].toLower;
-                            auto targetUser = usersByNick[targetNick];
-                            auto targetBit =
-                              c == 'o' ? UserChannel.MODE_o
-                            : c == 'h' ? UserChannel.MODE_h
-                            :/* == 'v'*/ UserChannel.MODE_v
-                            ;
-                            targetNick = targetUser.nick;
-                            auto ucPtr = targetUser.iid in chan.users;
-                            if (ucPtr !is null && ((ucPtr.bmodes & targetBit) != 0) != modeSign)
+                            auto targetUserPtr = targetNick in usersByNick;
+                            if (targetUserPtr is null)
                             {
-                              echoUCModesChanged[modeSign][c] ~= targetNick;
-                              if (modeSign) ucPtr.bmodes |= targetBit;
-                              else          ucPtr.bmodes &= ~targetBit;
+                              user.tx401(target);
+                            }
+                            else
+                            {
+                              auto targetBit =
+                                c == 'o' ? UserChannel.MODE_o
+                              : c == 'h' ? UserChannel.MODE_h
+                              :/* == 'v'*/ UserChannel.MODE_v
+                              ;
+                              targetNick = targetUserPtr.nick;
+                              auto ucPtr = targetUserPtr.iid in chan.users;
+                              if (ucPtr !is null && ((ucPtr.bmodes & targetBit) != 0) != modeSign)
+                              {
+                                echoUCModesChanged[modeSign][c] ~= targetNick;
+                                if (modeSign) ucPtr.bmodes |= targetBit;
+                                else          ucPtr.bmodes &= ~targetBit;
+                              }
                             }
                           }
                         break;
@@ -1053,12 +1079,11 @@ shared static this() {
                     user.txsn!"502 %s :Can't change mode for other users";
                     break;
                   }
-                  auto targetUserPtr =
-                    canonicalTarget == user.canonicalNick ?
-                    &user : (canonicalTarget in usersByNick);
+                  auto targetUserPtr = canonicalTarget in usersByNick;
                   if (targetUserPtr is null)
                   {
                     user.tx401(target);
+                    break;
                   }
                   if (words.length == 2)
                   {
@@ -1441,7 +1466,7 @@ shared static this() {
               , targetUserPtr.channelsString
               );
               /* 312 RPL_WHOISSERVER */
-              user.txsn!"312 %s %s %s :%s"(
+              user.txsn!"312 %s %s %s %s :%s"(
                 targetUserPtr.nick
               , targetUserPtr.servername
               , serverHostname
