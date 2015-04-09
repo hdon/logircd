@@ -326,7 +326,7 @@ class User {
       channels.byValue
       .filter!((UserChannel uc){return uc.joined;})
       .map!((UserChannel uc) {
-        return uc.qualifiedString;
+        return uc.qualifiedChannelName;
       })
     , " ");
   }
@@ -520,13 +520,14 @@ class UserChannel {
     this.user = user;
     this.chan = chan;
   }
-  string qualifiedString()
+  /* Return channel name with optional preceding symbol representing modes +ohv */
+  string qualifiedChannelName()
   {
     return format("%s%s",
       (bmodes & MODE_o) ? "@" :
       (bmodes & MODE_h) ? "%" :
       (bmodes & MODE_v) ? "+" :
-      "", user.nick);
+      "", chan.name);
   }
   override string toString() {
     return format("UserChannel(user=%s:%s, chan=%s)", user.nick, user.iid, chan.name);
