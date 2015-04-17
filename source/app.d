@@ -324,7 +324,7 @@ class User {
     return cast(string)
     std.array.join(
       channels.byValue
-      .filter!((UserChannel uc){return uc.joined;})
+      .filter!((UserChannel uc){return uc.joined && 0 == (uc.chan.bmodes & Channel.MODE_a);})
       .map!((UserChannel uc) {
         return uc.qualifiedChannelName;
       })
