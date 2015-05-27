@@ -319,12 +319,23 @@ class User {
   bool isAway;
   string awayMessage;
 
-  string channelsString()
+  string channelsString(User perspective)
   {
     return cast(string)
     std.array.join(
       channels.byValue
-      .filter!((UserChannel uc){return uc.joined && 0 == (uc.chan.bmodes & Channel.MODE_a);})
+      .filter!((UserChannel uc){
+        if (!uc.joined)
+          return false;
+        /* Protect users' memberships to MODE_a channels */
+        if (uc.chan.bmodes & Channel.MODE_a)
+          return false;
+        auto perspectiveUcPtr = perspective.iid in uc.chan.users;
+        /* Protect users' membersehip to MODE_s channels */
+        if (uc.chan.bmodes & Channel.MODE_s)
+          return perspectiveUcPtr !is null;
+        return true;
+      })
       .map!((UserChannel uc) {
         return uc.qualifiedChannelName;
       })
@@ -477,6 +488,7 @@ class Channel {
     char[32] buf;
     size_t i;
     buf[i++] = '+';
+    if (bmodes & MODE_a) buf[i++] = 'a';
     if (bmodes & MODE_n) buf[i++] = 'n';
     if (bmodes & MODE_t) buf[i++] = 't';
     if (bmodes & MODE_s) buf[i++] = 's';
@@ -735,7 +747,8 @@ shared static this() {
               lineParser.length = 0;
               break;
             }
-            words ~= lineParser[0..n];
+            if (n > 0)
+              words ~= lineParser[0..n];
             if (m == n+1) {
               words ~= lineParser[m+1..$];
               lineParser.length = 0;
@@ -1464,7 +1477,7 @@ shared static this() {
               /* 319 RPL_WHOISCHANNELS */
               user.txsn!"319 %s %s :%s"(
                 targetUserPtr.nick
-              , targetUserPtr.channelsString
+              , targetUserPtr.channelsString(user)
               );
               /* 312 RPL_WHOISSERVER */
               user.txsn!"312 %s %s %s %s :%s"(
