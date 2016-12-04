@@ -4,9 +4,12 @@ import std.stdio;
 import std.range;
 import std.array;
 import std.string;
+import std.algorithm;
 import std.path : globMatch;
-import core.stdc.ctype;
 import numerics;
+import core.stdc.ctype;
+static import core.stdc.time;
+static import core.stdc.stdlib;
 alias ajoin = std.array.join;
 
 immutable string serverHostname;
@@ -66,8 +69,8 @@ class User {
   enum MODE_MAX = 8;
   uint bmodes;
 
-  static immutable uint MODES[char];
-  static immutable char SEDOM[uint];
+  static immutable uint[char] MODES;
+  static immutable char[uint] SEDOM;
   static this()
   {
     MODES = [
@@ -368,7 +371,7 @@ class Channel {
   enum MODE_i = 0x00000008;    /* INVITE */
   enum MODE_m = 0x00000010;    /* MODERATED */
   enum MODE_a = 0x00000020;    /* ANONYMOUS */
-  static immutable uint MODES[char];
+  static immutable uint[char] MODES;
 
   static this()
   {
